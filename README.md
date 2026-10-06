@@ -53,6 +53,3 @@ If Gemini reports a quota/spend-cap error, the backend uses its separate Edge TT
 
 See [Architecture and Data Flow](./ARCHITECTURE_AND_DATA_FLOW.md) for the detailed system diagram, conversation pipeline, patient matching rules, Redis behavior, environment variables, logs, flashing steps, and troubleshooting guidance.
 
-## Keep credentials and patient data private
-
-Do not commit `backend/.env`, API keys, hardware tokens, Wi-Fi passwords, roster exports, or patient records. The generated `sdkconfig` can contain local Wi-Fi settings and is ignored by Git. Treat backend logs as sensitive because they may include speech transcripts, patient names, and patient IDs.
