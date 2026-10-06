@@ -1,0 +1,35 @@
+# ESP-IDF Build Artifacts
+build/
+managed_components/
+.cache/
+.pio/
+sdkconfig.old
+*.bin
+*.elf
+*.map
+
+# Environment & Private Keys
+.env
+*.pem
+*.key
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
+backend/patient_persona.json
+backend/code_dump*.md
+*.zip
+
+# Python Cache & Media
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+scratch/
+.venv/
+venv/
+
+# OS & IDE Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,53 @@
+menu "Gemini Assistant Configuration"
+
+    config ASSISTANT_WIFI_SSID
+        string "Primary WiFi SSID"
+        default "YOUR_WIFI_SSID"
+        help
+            Primary SSID of the WiFi network to connect to.
+
+    config ASSISTANT_WIFI_PASSWORD
+        string "Primary WiFi Password"
+        default "YOUR_WIFI_PASSWORD"
+        help
+            Password of the primary WiFi network.
+
+    config ASSISTANT_WIFI_SSID_ALT
+        string "Fallback WiFi SSID"
+        default "YOUR_WIFI_SSID"
+        help
+            Fallback SSID if primary fails or drops.
+
+    config ASSISTANT_WIFI_PASSWORD_ALT
+        string "Fallback WiFi Password"
+        default "YOUR_WIFI_PASSWORD"
+        help
+            Password of the fallback WiFi network.
+
+    config ASSISTANT_SERVER_IP
+        string "Relay Server Host / IP / Domain"
+        default "YOUR_BACKEND_HOST"
+        help
+            LAN IP address or domain name of the backend relay server (for example 192.168.50.53).
+
+    config ASSISTANT_SERVER_PORT
+        string "Relay Server Port"
+        default "8008"
+        help
+            Port of the backend relay server (e.g. 8008).
+
+    config ASSISTANT_SERVER_USE_TLS
+        bool "Use secure WSS for the relay"
+        default n
+        help
+            Enable for a hosted TLS endpoint on port 443. Leave disabled for
+            a local FastAPI/Uvicorn backend on the LAN.
+
+    config ASSISTANT_DOCTOR_ID
+        string "Doctor ID used in the WebSocket path"
+        default "YOUR_DOCTOR_ID"
+        help
+            Configure this to the doctor ID assigned by your backend.
+
+endmenu
+
