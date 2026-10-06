@@ -2,6 +2,7 @@
 #include "driver/gpio.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
@@ -27,27 +28,36 @@ static const char *TAG = "GEMINI_ASSISTANT";
 
 #define SERVER_IP CONFIG_ASSISTANT_SERVER_IP
 #define SERVER_PORT CONFIG_ASSISTANT_SERVER_PORT
-#define DOCTOR_ID CONFIG_ASSISTANT_DOCTOR_ID // ws://SERVER:PORT/ws/live/{DOCTOR_ID}
+#define DOCTOR_ID                                                              \
+  CONFIG_ASSISTANT_DOCTOR_ID // ws://SERVER:PORT/ws/live/{DOCTOR_ID}
 
 #define SAMPLE_RATE 16000
-#define CHANNELS 2         // ES7210 hardware input channels
-#define CHUNK_SAMPLES 512  // 32 ms @ 16 kHz
+#define CHANNELS 2        // ES7210 hardware input channels
+#define CHUNK_SAMPLES 512 // 32 ms @ 16 kHz
 #define CHUNK_MONO_BYTES (CHUNK_SAMPLES * sizeof(int16_t))
 
-#define VAD_WAKE_THRESHOLD_RMS 100.0f   // start a session
-#define VAD_ACTIVE_THRESHOLD_RMS 80.0f  // "user is talking"
-#define WAKE_CONFIRM_CHUNKS 2           // need 2 loud chunks (~64 ms) so clicks don't wake us
-#define MIN_SPEECH_DURATION_MS 200      // ignore blips shorter than this
-#define SILENCE_TIMEOUT_MS 1000         // trailing silence => utterance finished
-#define IDLE_STANDBY_TIMEOUT_S 30       // inactivity => Standby
+#define VAD_WAKE_THRESHOLD_RMS 100.0f  // start a session
+#define VAD_ACTIVE_THRESHOLD_RMS 80.0f // "user is talking"
+#define WAKE_CONFIRM_CHUNKS                                                    \
+  2 // need 2 loud chunks (~64 ms) so clicks don't wake us
+#define MIN_SPEECH_DURATION_MS 200 // ignore blips shorter than this
+#define SILENCE_TIMEOUT_MS 1000    // trailing silence => utterance finished
+#define IDLE_STANDBY_TIMEOUT_S 30  // inactivity => Standby
 #define GEMINI_RESPONSE_TIMEOUT_MS 45000
-#define MIC_HOLDOFF_AFTER_PLAYBACK_MS 400  // keep mic muted after speaker stops (room echo tail)
+#define MIC_HOLDOFF_AFTER_PLAYBACK_MS                                          \
+  400 // keep mic muted after speaker stops (room echo tail)
+#define BARGE_IN_THRESHOLD_RMS                                                 \
+  300.0f // deliberate close speech while the speaker is active
+#define BARGE_IN_CONFIRM_CHUNKS                                                \
+  8 // 256 ms prevents normal speaker echo from interrupting
 
 // Playback
-#define PLAYBACK_RB_SIZE 65536             // 2.0 s of 16 kHz mono s16
-#define PLAYBACK_PREBUFFER_BYTES 6400      // 200 ms cushion before (re)starting playback
-#define PLAYBACK_STALL_TIMEOUT_MS 6000     // tolerate tool-call gaps mid-turn
-#define PLAYBACK_TAIL_FLUSH_MS 250         // play a short tail even if turn_complete is late
+#define PLAYBACK_RB_SIZE 65536 // 2.0 s of 16 kHz mono s16
+#define PLAYBACK_PREBUFFER_BYTES                                               \
+  6400 // 200 ms cushion before (re)starting playback
+#define PLAYBACK_STALL_TIMEOUT_MS 6000 // tolerate tool-call gaps mid-turn
+#define PLAYBACK_TAIL_FLUSH_MS                                                 \
+  250 // play a short tail even if turn_complete is late
 
 // ==========================================================
 // STATE
@@ -81,6 +91,8 @@ static volatile bool s_status_only_after_playback = false;
 static volatile size_t s_buffered_bytes = 0;
 static volatile bool s_is_prebuffering = true;
 static volatile size_t s_dropped_bytes = 0;
+static char s_device_id[13] =
+    "unknown"; // stable Wi-Fi MAC, used only as a reconnect/session key
 
 // odd-byte carry so the PCM stream always stays 16-bit aligned
 static uint8_t s_odd_byte = 0;
@@ -107,6 +119,7 @@ static inline void buffered_sub(size_t n) {
 static inline size_t buffered_get(void) {
   return __atomic_load_n(&s_buffered_bytes, __ATOMIC_SEQ_CST);
 }
+static inline bool ws_ready(void);
 
 static float compute_pcm_rms(const int16_t *pcm_samples, int num_samples) {
   if (num_samples <= 0)
@@ -142,10 +155,29 @@ static void flush_playback_ringbuffer(void) {
   if (s_audio_play_rb) {
     size_t sz = 0;
     uint8_t *it;
-    while ((it = (uint8_t *)xRingbufferReceive(s_audio_play_rb, &sz, 0)) != NULL) {
+    while ((it = (uint8_t *)xRingbufferReceive(s_audio_play_rb, &sz, 0)) !=
+           NULL) {
       buffered_sub(sz);
       vRingbufferReturnItem(s_audio_play_rb, (void *)it);
     }
+  }
+}
+
+// Interrupting is deliberately separate from ending the conversation. It
+// stops current playback immediately and lets the doctor continue speaking.
+static void request_interruption(const char *reason) {
+  if (s_conv_state == CONV_STATE_STANDBY)
+    return;
+  ESP_LOGI(TAG, "⏹️ Interrupt requested (%s)", reason);
+  flush_playback_ringbuffer();
+  s_playback_ctx.is_playing = false;
+  s_conv_state = CONV_STATE_LISTENING;
+  s_last_speech_time_ms = now_ms();
+  update_led_state(CONV_STATE_LISTENING);
+  if (ws_ready()) {
+    const char *interrupt = "{\"event\":\"interrupt\"}";
+    esp_websocket_client_send_text(s_persistent_ws_client, interrupt,
+                                   strlen(interrupt), pdMS_TO_TICKS(250));
   }
 }
 
@@ -196,9 +228,12 @@ static void led_animation_task(void *pvParameters) {
         float w2 = (1.0f + sinf(step * 0.35f)) / 2.0f;
         float w3 = (1.0f + sinf(step * 0.35f + 1.0f)) / 2.0f;
         float w4 = (1.0f + sinf(step * 0.35f + 2.0f)) / 2.0f;
-        rgb_led_set_pixel(2, (uint8_t)(170 * w2), (uint8_t)(120 * w2), (uint8_t)(220 * w2));
-        rgb_led_set_pixel(3, (uint8_t)(170 * w3), (uint8_t)(120 * w3), (uint8_t)(220 * w3));
-        rgb_led_set_pixel(4, (uint8_t)(170 * w4), (uint8_t)(120 * w4), (uint8_t)(220 * w4));
+        rgb_led_set_pixel(2, (uint8_t)(170 * w2), (uint8_t)(120 * w2),
+                          (uint8_t)(220 * w2));
+        rgb_led_set_pixel(3, (uint8_t)(170 * w3), (uint8_t)(120 * w3),
+                          (uint8_t)(220 * w3));
+        rgb_led_set_pixel(4, (uint8_t)(170 * w4), (uint8_t)(120 * w4),
+                          (uint8_t)(220 * w4));
         break;
       }
       }
@@ -215,7 +250,8 @@ static void led_animation_task(void *pvParameters) {
 static void finish_playback(void) {
   static const uint8_t zero_silence[1024] = {0};
   if (s_playback_ctx.play_dev)
-    esp_codec_dev_write(s_playback_ctx.play_dev, (void *)zero_silence, sizeof(zero_silence));
+    esp_codec_dev_write(s_playback_ctx.play_dev, (void *)zero_silence,
+                        sizeof(zero_silence));
   s_playback_ctx.is_playing = false;
   s_is_prebuffering = true;
   s_turn_complete = false;
@@ -226,7 +262,8 @@ static void finish_playback(void) {
   s_end_conversation_after_playback = false;
   if (s_conv_state == CONV_STATE_SPEAKING) {
     s_conv_state = status_only ? CONV_STATE_THINKING
-                               : (end_conversation ? CONV_STATE_STANDBY : CONV_STATE_LISTENING);
+                               : (end_conversation ? CONV_STATE_STANDBY
+                                                   : CONV_STATE_LISTENING);
     s_last_speech_time_ms = now_ms();
     update_led_state(s_conv_state);
     if (status_only)
@@ -234,7 +271,8 @@ static void finish_playback(void) {
     else if (end_conversation)
       ESP_LOGI(TAG, "🗣️ Sign-off finished. Conversation returned to standby.");
     else
-      ESP_LOGI(TAG, "🗣️ Assistant finished speaking. Ready for the next question.");
+      ESP_LOGI(TAG,
+               "🗣️ Assistant finished speaking. Ready for the next question.");
   }
 }
 
@@ -246,8 +284,10 @@ static void audio_playback_task(void *pvParameters) {
     if (s_is_prebuffering) {
       size_t buffered = buffered_get();
       bool have = buffered > 0;
-      bool stale = have && ((now_ms() - s_last_audio_rx_ms) > PLAYBACK_TAIL_FLUSH_MS);
-      if (buffered >= PLAYBACK_PREBUFFER_BYTES || (have && (s_turn_complete || stale))) {
+      bool stale =
+          have && ((now_ms() - s_last_audio_rx_ms) > PLAYBACK_TAIL_FLUSH_MS);
+      if (buffered >= PLAYBACK_PREBUFFER_BYTES ||
+          (have && (s_turn_complete || stale))) {
         s_is_prebuffering = false;
       } else {
         if (s_playback_ctx.is_playing) { // waiting for more audio mid-turn
@@ -263,7 +303,8 @@ static void audio_playback_task(void *pvParameters) {
     }
 
     size_t item_size = 0;
-    uint8_t *item = (uint8_t *)xRingbufferReceive(s_audio_play_rb, &item_size, pdMS_TO_TICKS(100));
+    uint8_t *item = (uint8_t *)xRingbufferReceive(s_audio_play_rb, &item_size,
+                                                  pdMS_TO_TICKS(100));
 
     if (item != NULL) {
       size_t raw_size = item_size;
@@ -271,7 +312,8 @@ static void audio_playback_task(void *pvParameters) {
       if (item_size > 0) {
         stall_ms = 0;
         s_playback_ctx.is_playing = true;
-        if (s_conv_state == CONV_STATE_LISTENING || s_conv_state == CONV_STATE_THINKING) {
+        if (s_conv_state == CONV_STATE_LISTENING ||
+            s_conv_state == CONV_STATE_THINKING) {
           s_conv_state = CONV_STATE_SPEAKING;
           update_led_state(CONV_STATE_SPEAKING);
         }
@@ -287,7 +329,8 @@ static void audio_playback_task(void *pvParameters) {
         finish_playback(); // real end of the reply
         stall_ms = 0;
       } else {
-        s_is_prebuffering = true; // underrun / tool-call gap: rebuffer instead of stuttering
+        s_is_prebuffering =
+            true; // underrun / tool-call gap: rebuffer instead of stuttering
       }
     }
   }
@@ -301,8 +344,8 @@ static void rb_push(const uint8_t *p, size_t n) {
     buffered_add(n);
   } else {
     s_dropped_bytes += n;
-    ESP_LOGW(TAG, "Playback ring full — dropped %u bytes (total %u)", (unsigned)n,
-             (unsigned)s_dropped_bytes);
+    ESP_LOGW(TAG, "Playback ring full — dropped %u bytes (total %u)",
+             (unsigned)n, (unsigned)s_dropped_bytes);
   }
 }
 
@@ -343,7 +386,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
       ESP_LOGW(TAG, "⚡ WebSocket disconnected");
     s_ws_connected = false;
     if (s_conv_state != CONV_STATE_STANDBY) {
-      // Server-side conversation context is gone; start clean on next voice activity.
+      // Server-side conversation context is gone; start clean on next voice
+      // activity.
       s_conv_state = CONV_STATE_STANDBY;
       flush_playback_ringbuffer();
     }
@@ -352,7 +396,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
   case WEBSOCKET_EVENT_DATA:
     if (data->op_code == 0x01) { // text/JSON
       ESP_LOGI(TAG, "📩 WS: %.*s", data->data_len, data->data_ptr);
-      if (payload_contains(data->data_ptr, data->data_len, "status_audio_end")) {
+      if (payload_contains(data->data_ptr, data->data_len,
+                           "status_audio_end")) {
         s_status_only_after_playback = true;
         s_turn_complete = true;
         if (buffered_get() == 0 && !s_playback_ctx.is_playing)
@@ -365,10 +410,12 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
         if (s_conv_state == CONV_STATE_THINKING) {
           // No audio means playback cannot transition the state later.
           bool end_conversation = s_end_conversation_after_playback &&
-                                  buffered_get() == 0 && !s_playback_ctx.is_playing;
+                                  buffered_get() == 0 &&
+                                  !s_playback_ctx.is_playing;
           if (end_conversation)
             s_end_conversation_after_playback = false;
-          s_conv_state = end_conversation ? CONV_STATE_STANDBY : CONV_STATE_LISTENING;
+          s_conv_state =
+              end_conversation ? CONV_STATE_STANDBY : CONV_STATE_LISTENING;
           s_last_speech_time_ms = now_ms();
           update_led_state(s_conv_state);
           if (end_conversation)
@@ -377,15 +424,16 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
             ESP_LOGI(TAG, "⚡ Turn complete (no audio). Listening again.");
         }
       }
-    } else if ((data->op_code == 0x02 || data->op_code == 0x00) && data->data_len > 0 &&
-               s_audio_play_rb) {
+    } else if ((data->op_code == 0x02 || data->op_code == 0x00) &&
+               data->data_len > 0 && s_audio_play_rb) {
       if (s_conv_state == CONV_STATE_STANDBY)
         break; // user stopped the session; discard the rest of the reply
       // A turn_complete left over from a turn that never played audio is stale.
       if (s_turn_complete && !s_playback_ctx.is_playing && buffered_get() == 0)
         s_turn_complete = false;
       s_last_audio_rx_ms = now_ms();
-      s_last_speech_time_ms = s_last_audio_rx_ms; // keeps THINKING/idle timers alive
+      s_last_speech_time_ms =
+          s_last_audio_rx_ms; // keeps THINKING/idle timers alive
       enqueue_audio((const uint8_t *)data->data_ptr, (size_t)data->data_len);
     }
     break;
@@ -411,14 +459,16 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
   }
 
   if (s_persistent_ws_client != NULL) {
-    if (s_ws_connected && esp_websocket_client_is_connected(s_persistent_ws_client)) {
+    if (s_ws_connected &&
+        esp_websocket_client_is_connected(s_persistent_ws_client)) {
       xSemaphoreGive(s_ws_connect_mutex);
       return ESP_OK;
     }
     // The client auto-reconnects; give it a moment before tearing it down.
     for (int i = 0; i < 30 && !s_ws_connected; i++)
       vTaskDelay(pdMS_TO_TICKS(50));
-    if (s_ws_connected && esp_websocket_client_is_connected(s_persistent_ws_client)) {
+    if (s_ws_connected &&
+        esp_websocket_client_is_connected(s_persistent_ws_client)) {
       xSemaphoreGive(s_ws_connect_mutex);
       return ESP_OK;
     }
@@ -430,19 +480,22 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
     s_ws_connected = false;
   }
 
-  char ws_url[200];
-  if (strlen(SERVER_PORT) == 0 || strcmp(SERVER_PORT, "80") == 0 || strcmp(SERVER_PORT, "443") == 0)
-    snprintf(ws_url, sizeof(ws_url), "ws://%s/ws/live/%s", SERVER_IP, DOCTOR_ID);
+  char ws_url[240];
+  if (strlen(SERVER_PORT) == 0 || strcmp(SERVER_PORT, "80") == 0 ||
+      strcmp(SERVER_PORT, "443") == 0)
+    snprintf(ws_url, sizeof(ws_url), "ws://%s/ws/live/%s?device_id=%s",
+             SERVER_IP, DOCTOR_ID, s_device_id);
   else
-    snprintf(ws_url, sizeof(ws_url), "ws://%s:%s/ws/live/%s", SERVER_IP, SERVER_PORT, DOCTOR_ID);
+    snprintf(ws_url, sizeof(ws_url), "ws://%s:%s/ws/live/%s?device_id=%s",
+             SERVER_IP, SERVER_PORT, DOCTOR_ID, s_device_id);
 
   ESP_LOGI(TAG, "Connecting WebSocket: %s", ws_url);
 
   esp_websocket_client_config_t ws_cfg = {
       .uri = ws_url,
       .buffer_size = 32768,
-      .reconnect_timeout_ms = 1000,
-      .network_timeout_ms = 4000,
+      .reconnect_timeout_ms = 1500,
+      .network_timeout_ms = 8000,
       .ping_interval_sec = 5,
       .pingpong_timeout_sec = 10,
   };
@@ -493,7 +546,9 @@ static void websocket_maintenance_task(void *pvParameters) {
 
     esp_err_t err = ensure_websocket_connected(&s_playback_ctx);
     if (err != ESP_OK && now_ms() - last_warning_ms >= 10000) {
-      ESP_LOGW(TAG, "WebSocket reconnect is still pending (%s). Microphone task remains responsive.",
+      ESP_LOGW(TAG,
+               "WebSocket reconnect is still pending (%s). Microphone task "
+               "remains responsive.",
                esp_err_to_name(err));
       last_warning_ms = now_ms();
     }
@@ -518,9 +573,11 @@ static void continuous_mic_stream_task(void *pvParameters) {
     esp_get_feed_data(true, (int16_t *)raw_chunk, chunk_raw_bytes);
 
   int16_t chunk_mono[CHUNK_SAMPLES];
-  int16_t preroll[CHUNK_SAMPLES * 2] = {0}; // last 2 chunks (64 ms) so the first consonant isn't lost
-  int pre_chunks = 0;                       // how many of those are valid (0..2)
+  int16_t preroll[CHUNK_SAMPLES * 2] = {
+      0};             // last 2 chunks (64 ms) so the first consonant isn't lost
+  int pre_chunks = 0; // how many of those are valid (0..2)
   int wake_hits = 0;
+  int barge_hits = 0;
 
   int speech_accum_ms = 0;
   int silence_accum_ms = 0;
@@ -530,7 +587,8 @@ static void continuous_mic_stream_task(void *pvParameters) {
   ESP_LOGI(TAG, "🎙️ Mic streaming engine started.");
 
   while (1) {
-    if (esp_get_feed_data(true, (int16_t *)raw_chunk, chunk_raw_bytes) != ESP_OK) {
+    if (esp_get_feed_data(true, (int16_t *)raw_chunk, chunk_raw_bytes) !=
+        ESP_OK) {
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -545,9 +603,23 @@ static void continuous_mic_stream_task(void *pvParameters) {
     float rms = compute_pcm_rms(chunk_mono, chunk_samples);
     int64_t t = now_ms();
 
-    // 1. Mic is muted while the assistant speaks (+ echo tail) to avoid feedback.
-    if (s_conv_state == CONV_STATE_SPEAKING ||
-        (t - s_playback_ended_time_ms) < MIC_HOLDOFF_AFTER_PLAYBACK_MS) {
+    // 1. While speaking, accept only sustained loud close-range speech as an
+    // interrupt. Normal audio from our own speaker remains ignored.
+    if (s_conv_state == CONV_STATE_SPEAKING) {
+      if (rms >= BARGE_IN_THRESHOLD_RMS &&
+          ++barge_hits >= BARGE_IN_CONFIRM_CHUNKS) {
+        request_interruption("voice barge-in");
+        barge_hits = 0;
+      } else if (rms < BARGE_IN_THRESHOLD_RMS) {
+        barge_hits = 0;
+      }
+      speech_accum_ms = silence_accum_ms = 0;
+      pre_chunks = wake_hits = 0;
+      continue;
+    }
+    barge_hits = 0;
+    // Briefly mute the echo tail after the speaker stops.
+    if ((t - s_playback_ended_time_ms) < MIC_HOLDOFF_AFTER_PLAYBACK_MS) {
       speech_accum_ms = silence_accum_ms = 0;
       pre_chunks = wake_hits = 0;
       continue;
@@ -556,11 +628,13 @@ static void continuous_mic_stream_task(void *pvParameters) {
     // 2. STANDBY: wait for confirmed voice activity
     if (s_conv_state == CONV_STATE_STANDBY) {
       if (rms >= VAD_WAKE_THRESHOLD_RMS && ++wake_hits >= WAKE_CONFIRM_CHUNKS) {
-        ESP_LOGI(TAG, "🗣️ Voice detected (RMS %.1f). Activating session...", rms);
+        ESP_LOGI(TAG, "🗣️ Voice detected (RMS %.1f). Activating session...",
+                 rms);
         if (!ws_ready()) {
           // Reconnect runs in websocket_maintenance_task; never block the
           // real-time mic task while it repairs the connection.
-          ESP_LOGW(TAG, "WebSocket is not connected; this utterance was not sent. Waiting for reconnect.");
+          ESP_LOGW(TAG, "WebSocket is not connected; this utterance was not "
+                        "sent. Waiting for reconnect.");
           wake_hits = 0;
           pre_chunks = 0;
           speech_accum_ms = silence_accum_ms = 0;
@@ -571,10 +645,12 @@ static void continuous_mic_stream_task(void *pvParameters) {
         s_last_speech_time_ms = t;
         if (pre_chunks > 0) {
           int off = (2 - pre_chunks) * chunk_samples;
-          esp_websocket_client_send_bin(s_persistent_ws_client, (const char *)(preroll + off),
-                                        pre_chunks * CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
+          esp_websocket_client_send_bin(
+              s_persistent_ws_client, (const char *)(preroll + off),
+              pre_chunks * CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
         }
-        esp_websocket_client_send_bin(s_persistent_ws_client, (const char *)chunk_mono,
+        esp_websocket_client_send_bin(s_persistent_ws_client,
+                                      (const char *)chunk_mono,
                                       CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
         speech_accum_ms = chunk_duration_ms * WAKE_CONFIRM_CHUNKS;
         silence_accum_ms = 0;
@@ -583,8 +659,10 @@ static void continuous_mic_stream_task(void *pvParameters) {
         if (rms < VAD_WAKE_THRESHOLD_RMS)
           wake_hits = 0;
         // slide pre-roll window
-        memcpy(preroll, preroll + chunk_samples, chunk_samples * sizeof(int16_t));
-        memcpy(preroll + chunk_samples, chunk_mono, chunk_samples * sizeof(int16_t));
+        memcpy(preroll, preroll + chunk_samples,
+               chunk_samples * sizeof(int16_t));
+        memcpy(preroll + chunk_samples, chunk_mono,
+               chunk_samples * sizeof(int16_t));
         if (pre_chunks < 2)
           pre_chunks++;
       }
@@ -597,36 +675,42 @@ static void continuous_mic_stream_task(void *pvParameters) {
         s_last_speech_time_ms = t;
         speech_accum_ms += chunk_duration_ms;
         silence_accum_ms = 0;
-        if (ws_ready() && esp_websocket_client_send_bin(s_persistent_ws_client,
-                                                        (const char *)chunk_mono, CHUNK_MONO_BYTES,
-                                                        pdMS_TO_TICKS(1000)) < 0)
+        if (ws_ready() && esp_websocket_client_send_bin(
+                              s_persistent_ws_client, (const char *)chunk_mono,
+                              CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0)
           ESP_LOGW(TAG, "Failed to stream PCM frame!");
       } else if (speech_accum_ms > 0) {
-        // Was talking, now quiet — keep streaming the silence so Gemini's VAD sees the pause.
+        // Was talking, now quiet — keep streaming the silence so Gemini's VAD
+        // sees the pause.
         silence_accum_ms += chunk_duration_ms;
         if (ws_ready())
-          esp_websocket_client_send_bin(s_persistent_ws_client, (const char *)chunk_mono,
+          esp_websocket_client_send_bin(s_persistent_ws_client,
+                                        (const char *)chunk_mono,
                                         CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
 
         if (silence_accum_ms >= SILENCE_TIMEOUT_MS) {
           if (speech_accum_ms >= MIN_SPEECH_DURATION_MS) {
-            ESP_LOGI(TAG, "⏹️ Utterance complete (speech %d ms, silence %d ms). Waiting for Gemini...",
+            ESP_LOGI(TAG,
+                     "⏹️ Utterance complete (speech %d ms, silence %d ms). "
+                     "Waiting for Gemini...",
                      speech_accum_ms, silence_accum_ms);
             const char *eot = "{\"event\":\"audio_end\"}";
             if (ws_ready())
-              esp_websocket_client_send_text(s_persistent_ws_client, eot, strlen(eot),
-                                             pdMS_TO_TICKS(500));
+              esp_websocket_client_send_text(s_persistent_ws_client, eot,
+                                             strlen(eot), pdMS_TO_TICKS(500));
             s_conv_state = CONV_STATE_THINKING;
             s_last_speech_time_ms = t;
             update_led_state(CONV_STATE_THINKING);
-            // NOTE: no ring-buffer flush here. Gemini may already be replying and a flush
-            // would delete the first words of the answer.
+            // NOTE: no ring-buffer flush here. Gemini may already be replying
+            // and a flush would delete the first words of the answer.
           } else {
-            ESP_LOGI(TAG, "…ignored a short noise blip (%d ms)", speech_accum_ms);
+            ESP_LOGI(TAG, "…ignored a short noise blip (%d ms)",
+                     speech_accum_ms);
           }
           speech_accum_ms = silence_accum_ms = 0;
         }
-      } else if ((t - s_last_speech_time_ms) > (IDLE_STANDBY_TIMEOUT_S * 1000)) {
+      } else if ((t - s_last_speech_time_ms) >
+                 (IDLE_STANDBY_TIMEOUT_S * 1000)) {
         ESP_LOGI(TAG, "⏳ Idle %d s. Back to Standby.", IDLE_STANDBY_TIMEOUT_S);
         s_conv_state = CONV_STATE_STANDBY;
         update_led_state(CONV_STATE_STANDBY);
@@ -638,7 +722,8 @@ static void continuous_mic_stream_task(void *pvParameters) {
     if (s_conv_state == CONV_STATE_THINKING) {
       speech_accum_ms = silence_accum_ms = 0;
       if ((t - s_last_speech_time_ms) > GEMINI_RESPONSE_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "⚠️ No Gemini response after %d ms. Listening again.", GEMINI_RESPONSE_TIMEOUT_MS);
+        ESP_LOGW(TAG, "⚠️ No Gemini response after %d ms. Listening again.",
+                 GEMINI_RESPONSE_TIMEOUT_MS);
         s_conv_state = CONV_STATE_LISTENING;
         s_last_speech_time_ms = t;
         update_led_state(CONV_STATE_LISTENING);
@@ -658,7 +743,8 @@ static void toggle_conversation(const char *who) {
   if (s_conv_state == CONV_STATE_STANDBY) {
     ESP_LOGI(TAG, "🔘 %s -> Conversation ACTIVATED", who);
     if (!ws_ready()) {
-      ESP_LOGW(TAG, "Cannot activate conversation: WebSocket is disconnected; reconnect is in progress.");
+      ESP_LOGW(TAG, "Cannot activate conversation: WebSocket is disconnected; "
+                    "reconnect is in progress.");
       s_conv_state = CONV_STATE_STANDBY;
       return;
     }
@@ -667,6 +753,7 @@ static void toggle_conversation(const char *who) {
     update_led_state(CONV_STATE_LISTENING);
   } else {
     ESP_LOGI(TAG, "🔘 %s -> Conversation STOPPED (Standby)", who);
+    request_interruption("manual stop");
     s_conv_state = CONV_STATE_STANDBY;
     flush_playback_ringbuffer();
     update_led_state(CONV_STATE_STANDBY);
@@ -707,16 +794,20 @@ static void gpio_button_task(void *pvParameters) {
       uint8_t port1 = (uint8_t)(tca_val >> 8);
       uint8_t prev_port1 = (uint8_t)(prev_tca_val >> 8);
 
-      if ((port1 & 0x02) == 0 && (prev_port1 & 0x02) != 0) { // Button 1: Vol +15
+      if ((port1 & 0x02) == 0 &&
+          (prev_port1 & 0x02) != 0) { // Button 1: Vol +15
         int v = bsp_board_get_volume() + 15;
-        if (v > 100) v = 100;
+        if (v > 100)
+          v = 100;
         bsp_board_set_volume(v);
         ESP_LOGI(TAG, "🔊 Volume UP: %d%%", v);
         show_volume(v);
       }
-      if ((port1 & 0x04) == 0 && (prev_port1 & 0x04) != 0) { // Button 2: Vol -15
+      if ((port1 & 0x04) == 0 &&
+          (prev_port1 & 0x04) != 0) { // Button 2: Vol -15
         int v = bsp_board_get_volume() - 15;
-        if (v < 0) v = 0;
+        if (v < 0)
+          v = 0;
         bsp_board_set_volume(v);
         ESP_LOGI(TAG, "🔉 Volume DOWN: %d%%", v);
         show_volume(v);
@@ -737,7 +828,8 @@ void app_main(void) {
   ESP_LOGI(TAG, "================================================");
   ESP_LOGI(TAG, " ESP32-S3 Continuous Full-Duplex Voice Assistant");
   ESP_LOGI(TAG, "================================================");
-  ESP_LOGI(TAG, "   • Say 'Hello Assistant' — it greets you and asks which patient");
+  ESP_LOGI(TAG,
+           "   • Say 'Hello Assistant' — it greets you and asks which patient");
   ESP_LOGI(TAG, "   • BOOT / Button 3: manual start-stop, Buttons 1&2: volume");
 
   ESP_ERROR_CHECK(esp_board_init(SAMPLE_RATE, 1, 16));
@@ -748,6 +840,13 @@ void app_main(void) {
   s_playback_ctx.play_dev = esp_ret_play_dev();
   s_playback_ctx.total_audio_read = 0;
   s_playback_ctx.is_playing = false;
+
+  uint8_t mac[6] = {0};
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+    snprintf(s_device_id, sizeof(s_device_id), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+  ESP_LOGI(TAG, "Device reconnect identity: %s", s_device_id);
 
   s_ws_connect_mutex = xSemaphoreCreateMutex();
   if (!s_ws_connect_mutex) {
@@ -762,8 +861,10 @@ void app_main(void) {
     rgb_led_set_all(255, 0, 0);
     return;
   }
-  xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 10240, NULL, 10, NULL, 1);
-  xTaskCreatePinnedToCore(gpio_button_task, "gpio_button_task", 6144, NULL, 4, NULL, 0);
+  xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 10240, NULL,
+                          10, NULL, 1);
+  xTaskCreatePinnedToCore(gpio_button_task, "gpio_button_task", 6144, NULL, 4,
+                          NULL, 0);
 
   ESP_LOGI(TAG, "Connecting to Wi-Fi...");
   if (wifi_init_sta() != ESP_OK) {
@@ -782,15 +883,18 @@ void app_main(void) {
     rgb_led_set_all(255, 100, 0); // Amber: device is up, relay is unavailable
   vTaskDelay(pdMS_TO_TICKS(400));
 
-  xTaskCreatePinnedToCore(led_animation_task, "led_anim_task", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(led_animation_task, "led_anim_task", 4096, NULL, 3,
+                          NULL, 0);
   s_boot_anim_done = true;
   update_led_state(s_conv_state);
 
   xTaskCreatePinnedToCore(websocket_maintenance_task, "ws_maintenance_task",
                           4096, NULL, 4, NULL, 0);
 
-  ESP_LOGI(TAG, "✅ Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+  ESP_LOGI(TAG, "✅ Free heap: %lu bytes",
+           (unsigned long)esp_get_free_heap_size());
   ESP_LOGI(TAG, "System ready.");
 
-  xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 8192, NULL, 9, NULL, 1);
+  xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 8192,
+                          NULL, 9, NULL, 1);
 }

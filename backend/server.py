@@ -63,6 +63,11 @@ OUT_GAIN = float(os.getenv("GEMINI_OUT_GAIN", "0.46"))       # applied while res
 IN_GAIN = float(os.getenv("GEMINI_IN_GAIN", "1.4"))          # mic boost
 MAX_LEAD_S = float(os.getenv("PLAYBACK_MAX_LEAD_S", "0.6"))  # keep extra headroom in the 2 s ESP playback ring
 TARGET_LEAD_S = float(os.getenv("PLAYBACK_TARGET_LEAD_S", "0.3"))
+# Small PCM WebSocket frames avoid a burst filling the ESP32 playback ring.
+# Keep this well below the device's 32 KiB transport buffer.
+AUDIO_WS_CHUNK_BYTES = max(512, min(4096, int(os.getenv("AUDIO_WS_CHUNK_BYTES", "2048"))))
+if AUDIO_WS_CHUNK_BYTES & 1:
+    AUDIO_WS_CHUNK_BYTES -= 1
 POST_PLAYBACK_MUTE_S = 0.6                                   # ignore mic this long after the speaker finishes
 
 CACHE_TTL_ROSTER_S = 600
@@ -70,8 +75,9 @@ CACHE_TTL_PERSONA_S = 300
 MAX_TOOL_RECORD_CHARS = 20000
 API1_REQUEST_TIMEOUT_S = float(os.getenv("API1_REQUEST_TIMEOUT_S", "35.0"))
 API2_REQUEST_TIMEOUT_S = float(os.getenv("API2_REQUEST_TIMEOUT_S", "8.0"))
+API2_MAX_ATTEMPTS = max(1, min(3, int(os.getenv("API2_MAX_ATTEMPTS", "2"))))
 TOOL_TIMEOUT_S = float(os.getenv("PATIENT_LOOKUP_TIMEOUT_S", "45.0"))
-GEMINI_NO_PROGRESS_TIMEOUT_S = float(os.getenv("GEMINI_NO_PROGRESS_TIMEOUT_S", "20.0"))
+GEMINI_NO_PROGRESS_TIMEOUT_S = float(os.getenv("GEMINI_NO_PROGRESS_TIMEOUT_S", "8.0"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 REDIS_TLS = os.getenv("REDIS_TLS", "0").strip().lower() in {"1", "true", "yes", "on"}
 REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "yhealth-assistant")
@@ -94,9 +100,22 @@ _roster_fetch_locks = {}     # doctor_id -> serialize refreshes and share one in
 _roster_fetch_generation = {}  # doctor_id -> incremented after each completed API 1 request
 _persona_by_id = {}          # patient_id -> (timestamp, persona_dict)
 _persona_status_by_id = {}   # doctor_id:patient_id -> last API 2 HTTP status or error
+_persona_fetch_locks = {}    # doctor_id:patient_id -> share one in-flight API 2 request
 _session_state_fallback = {}
 _clinical_notes = {}
 _escalated_alerts = {}
+_runtime_metrics = {
+    "started_at": time.time(), "ws_connected": 0, "ws_disconnected": 0,
+    "ws_active": 0, "gemini_sessions": 0, "gemini_reconnects": 0,
+    "api1_requests": 0, "api1_failures": 0, "api1_last_latency_ms": None,
+    "api2_requests": 0, "api2_retries": 0, "api2_failures": 0,
+    "api2_last_latency_ms": None,
+}
+_device_health = {}  # doctor_id:device_id -> last non-sensitive ESP32 health payload
+
+
+def _metric_inc(name: str, amount: int = 1):
+    _runtime_metrics[name] = int(_runtime_metrics.get(name, 0)) + amount
 
 
 def _url_for_log(url):
@@ -146,7 +165,7 @@ def get_redis_client():
             redis_url = "rediss://" + redis_url[len("redis://"):]
         _redis_client = AsyncRedis.from_url(
             redis_url, encoding="utf-8", decode_responses=True,
-            socket_connect_timeout=0.4, socket_timeout=0.6,
+            socket_connect_timeout=2.0, socket_timeout=3.0,
             health_check_interval=30,
         )
     return _redis_client
@@ -170,6 +189,12 @@ async def redis_get_json(key: str):
     if client is None:
         _warn_redis_once("Redis package is not installed; using the in-memory cache fallback.")
         return None
+    try:
+        raw = await client.get(key)
+        return json.loads(raw) if raw else None
+    except Exception as exc:
+        _warn_redis_once(f"Redis is unavailable; using the in-memory cache fallback ({type(exc).__name__}).")
+        return None
 
 
 async def redis_get_json_with_ttl(key: str):
@@ -190,12 +215,6 @@ async def redis_get_json_with_ttl(key: str):
         _warn_redis_once(f"Redis roster TTL read failed ({type(exc).__name__}); using the normal cache path.")
         # Without a reliable expiry, don't extend the lifetime of a stale roster.
         return await redis_get_json(key), 0
-    try:
-        raw = await client.get(key)
-        return json.loads(raw) if raw else None
-    except Exception as exc:
-        _warn_redis_once(f"Redis is unavailable; using the in-memory cache fallback ({type(exc).__name__}).")
-        return None
 
 
 async def redis_set_json(key: str, value, ttl_seconds: int):
@@ -621,6 +640,7 @@ async def _async_fetch_patient_list_locked(
     api1_started = time.perf_counter()
     try:
         client = get_http_client()
+        _metric_inc("api1_requests")
         resp = await client.get(
             f"{PATIENTS_API_BASE_URL}/{doctor_id}",
             headers={"accept": "application/json"},
@@ -656,9 +676,11 @@ async def _async_fetch_patient_list_locked(
                 logger.warning("API 1 returned 200 but no patients")
         else:
             _roster_status_by_doctor[doctor_id] = "unavailable"
+            _metric_inc("api1_failures")
             logger.warning(f"⚠️ API 1 returned status {resp.status_code} for doctor {doctor_id}")
     except Exception as e:
         _roster_status_by_doctor[doctor_id] = "stale" if stale else "unavailable"
+        _metric_inc("api1_failures")
         logger.warning(
             "API 1 roster request failed after %.1fs (%s); %s",
             time.perf_counter() - api1_started,
@@ -666,6 +688,7 @@ async def _async_fetch_patient_list_locked(
             "using the still-valid cached roster" if stale else "no usable cached roster is available",
         )
     finally:
+        _runtime_metrics["api1_last_latency_ms"] = round((time.perf_counter() - api1_started) * 1000, 1)
         _roster_fetch_generation[doctor_id] = _roster_fetch_generation.get(doctor_id, 0) + 1
     if stale and stale_expiry > time.time():
         _roster_by_doctor[doctor_id] = (time.time(), stale)
@@ -679,7 +702,17 @@ async def _async_fetch_patient_list_locked(
 
 
 async def async_fetch_patient_persona(patient_id: str, doctor_id: str = None, expected_record: dict = None):
-    """Fetch/cache only a non-empty persona whose identity matches its API 1 row."""
+    """Fetch/cache one persona and share concurrent requests for the same patient."""
+    cache_id = f"{doctor_id or PATIENTS_API_DOCTOR_ID}:{patient_id}"
+    lock = _persona_fetch_locks.get(cache_id)
+    if lock is None:
+        lock = _persona_fetch_locks.setdefault(cache_id, asyncio.Lock())
+    async with lock:
+        return await _async_fetch_patient_persona_locked(patient_id, doctor_id, expected_record)
+
+
+async def _async_fetch_patient_persona_locked(patient_id: str, doctor_id: str = None, expected_record: dict = None):
+    """Locked implementation of API 2 lookup; never caches an unverified identity."""
     cache_id = f"{doctor_id or PATIENTS_API_DOCTOR_ID}:{patient_id}"
     # v2 intentionally bypasses older unverified Redis entries from prior builds.
     cache_key = _redis_key("persona-v2", cache_id)
@@ -704,16 +737,31 @@ async def async_fetch_patient_persona(patient_id: str, doctor_id: str = None, ex
             return redis_hit
         await redis_delete(cache_key)
 
-    try:
-        client = get_http_client()
-        headers = {"accept": "*/*"}
-        if PERSONA_HARDWARE_TOKEN:
-            headers["x-hardware-token"] = PERSONA_HARDWARE_TOKEN
-        resp = await client.get(
-            f"{PERSONA_API_BASE_URL}/{patient_id}",
-            headers=headers,
-            timeout=httpx.Timeout(API2_REQUEST_TIMEOUT_S, connect=3.0),
-        )
+    client = get_http_client()
+    headers = {"accept": "*/*"}
+    if PERSONA_HARDWARE_TOKEN:
+        headers["x-hardware-token"] = PERSONA_HARDWARE_TOKEN
+    for attempt in range(1, API2_MAX_ATTEMPTS + 1):
+        api2_started = time.perf_counter()
+        try:
+            _metric_inc("api2_requests")
+            resp = await client.get(
+                f"{PERSONA_API_BASE_URL}/{patient_id}",
+                headers=headers,
+                timeout=httpx.Timeout(API2_REQUEST_TIMEOUT_S, connect=3.0),
+            )
+            _runtime_metrics["api2_last_latency_ms"] = round((time.perf_counter() - api2_started) * 1000, 1)
+        except Exception as e:
+            _persona_status_by_id[cache_id] = "error"
+            if attempt < API2_MAX_ATTEMPTS:
+                _metric_inc("api2_retries")
+                logger.warning("⚠️ API 2 fetch error (%s); retrying once", type(e).__name__)
+                await asyncio.sleep(0.25 * attempt)
+                continue
+            _metric_inc("api2_failures")
+            logger.warning(f"⚠️ API 2 fetch error: {type(e).__name__}")
+            return {}
+
         if resp.status_code == 200:
             data = resp.json()
             persona = _extract_persona_payload(data)
@@ -736,9 +784,14 @@ async def async_fetch_patient_persona(patient_id: str, doctor_id: str = None, ex
             _persona_by_id.pop(cache_id, None)
             await redis_delete(cache_key)
         logger.warning(f"⚠️ API 2 returned status {resp.status_code} for the matched patient")
-    except Exception as e:
-        _persona_status_by_id[cache_id] = "error"
-        logger.warning(f"⚠️ API 2 fetch error: {type(e).__name__}")
+        if resp.status_code in (408, 429) or 500 <= resp.status_code < 600:
+            if attempt < API2_MAX_ATTEMPTS:
+                _metric_inc("api2_retries")
+                logger.warning("API 2 transient status %s; retrying once", resp.status_code)
+                await asyncio.sleep(0.25 * attempt)
+                continue
+        _metric_inc("api2_failures")
+        return {}
     return {}
 
 
@@ -1577,8 +1630,17 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    connection_id = uuid.uuid4().hex
-    logger.info(f"🟢 ESP32 connected — doctor_id='{doctor_id}'")
+    # A hardware-derived ID lets a short Wi-Fi/WebSocket reconnect continue a
+    # duplicate-name selection instead of forgetting it. Reject arbitrary
+    # query values so they cannot create unsafe Redis keys.
+    supplied_device_id = (websocket.query_params.get("device_id") or "").strip().lower()
+    if re.fullmatch(r"[a-f0-9]{12}", supplied_device_id):
+        connection_id = f"esp32-{supplied_device_id}"
+        connection_label = supplied_device_id
+    else:
+        connection_id = uuid.uuid4().hex
+        connection_label = "temporary"
+    logger.info(f"🟢 ESP32 connected — doctor_id='{doctor_id}', device='{connection_label}'")
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
@@ -1646,6 +1708,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         "play_end": 0.0,        # when the ESP32 will have finished playing everything sent so far
         "last_activity": loop.time(),
         "last_rx": loop.time(),
+        "suppress_output": False,  # set by a device barge-in until Gemini ends the old turn
+        "conversation_ended": False,
     }
 
     last_queue_full_log = 0.0
@@ -1694,11 +1758,30 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                         await queue_put(("audio", boosted))
                         if chunk_counter % 50 == 0:
                             logger.info(f" 🎙️ streaming to Gemini ({audio_bytes} bytes this utterance)")
-                elif message.get("text") and "audio_end" in message["text"]:
-                    streaming = False
-                    logger.info(f"🎤 [ESP32 utterance end] {audio_bytes} bytes")
-                    audio_bytes = 0
-                    await queue_put(("turn_end", None))
+                elif message.get("text"):
+                    text = message["text"]
+                    if "interrupt" in text:
+                        # The device has already discarded queued speaker audio.
+                        # Do the same on the relay and wait for Gemini to mark
+                        # the old turn interrupted before accepting its output.
+                        streaming = False
+                        S["suppress_output"] = True
+                        S["is_speaking"] = False
+                        S["turn_pending"] = False
+                        S["mute_until"] = 0.0
+                        S["play_end"] = loop.time()
+                        while not audio_queue.empty():
+                            try:
+                                audio_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        logger.info("⏹️ Device requested a voice/button interrupt")
+                        await queue_put(("interrupt", None))
+                    elif "audio_end" in text:
+                        streaming = False
+                        logger.info(f"🎤 [ESP32 utterance end] {audio_bytes} bytes")
+                        audio_bytes = 0
+                        await queue_put(("turn_end", None))
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -1723,6 +1806,21 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
             esp["alive"] = False
             return False
 
+    async def send_pcm_paced(pcm: bytes) -> bool:
+        """Send small, paced PCM frames so a slow speaker never loses words."""
+        for offset in range(0, len(pcm), AUDIO_WS_CHUNK_BYTES):
+            if S["suppress_output"]:
+                return False
+            chunk = pcm[offset:offset + AUDIO_WS_CHUNK_BYTES]
+            now = loop.time()
+            S["play_end"] = max(S["play_end"], now) + len(chunk) / BYTES_PER_SEC_OUT
+            if not await ws_send_bytes(chunk):
+                return False
+            lead = S["play_end"] - loop.time()
+            if lead > MAX_LEAD_S:
+                await asyncio.sleep(lead - TARGET_LEAD_S)
+        return True
+
     async def speak_status_announcement(text: str, *, progress: bool = False) -> bool:
         """Speak a short backend-generated notice without calling Gemini."""
         previous_speaking_state = S["is_speaking"]
@@ -1745,16 +1843,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                 logger.warning("Status announcement TTS returned no audio")
                 return False
 
-            chunk_bytes = 8192
-            for offset in range(0, len(pcm), chunk_bytes):
-                chunk = pcm[offset:offset + chunk_bytes]
-                now = loop.time()
-                S["play_end"] = max(S["play_end"], now) + len(chunk) / BYTES_PER_SEC_OUT
-                if not await ws_send_bytes(chunk):
-                    return False
-                lead = S["play_end"] - loop.time()
-                if lead > MAX_LEAD_S:
-                    await asyncio.sleep(lead - TARGET_LEAD_S)
+            if not await send_pcm_paced(pcm):
+                return False
 
             S["mute_until"] = S["play_end"] + POST_PLAYBACK_MUTE_S
             event = {"event": "status_audio_end"} if progress else {"event": "turn_complete"}
@@ -1890,26 +1980,26 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                         out_txt.append(sc.output_transcription.text)
 
                                     if sc.model_turn is not None:
-                                        S["is_speaking"] = True
-                                        for part in (sc.model_turn.parts or []):
-                                            if part.inline_data and part.inline_data.data:
-                                                pcm16 = resampler.process(part.inline_data.data)
-                                                if not pcm16:
-                                                    continue
-                                                t = loop.time()
-                                                S["play_end"] = max(S["play_end"], t) + len(pcm16) / BYTES_PER_SEC_OUT
-                                                if not await ws_send_bytes(pcm16):
-                                                    return
-                                                # PACING: never run more than MAX_LEAD_S ahead of real-time playback,
-                                                # otherwise the ESP32 ring buffer overflows and audio is dropped.
-                                                lead = S["play_end"] - loop.time()
-                                                if lead > MAX_LEAD_S:
-                                                    await asyncio.sleep(lead - TARGET_LEAD_S)
+                                        if not S["suppress_output"]:
+                                            S["is_speaking"] = True
+                                            for part in (sc.model_turn.parts or []):
+                                                if part.inline_data and part.inline_data.data:
+                                                    pcm16 = resampler.process(part.inline_data.data)
+                                                    if not pcm16:
+                                                        continue
+                                                    if not await send_pcm_paced(pcm16):
+                                                        break
 
                                     if sc.interrupted or sc.turn_complete:
+                                        turn_was_suppressed = S["suppress_output"]
                                         if sc.interrupted and not sc.turn_complete:
                                             # An interrupted sign-off means the doctor resumed the conversation.
                                             S["end_after_turn"] = False
+                                        # Gemini has now finished the pre-interrupt response. Future
+                                        # audio belongs to the doctor's new turn and may be played.
+                                        if S["suppress_output"]:
+                                            S["suppress_output"] = False
+                                            logger.info("✅ Gemini acknowledged the device interrupt")
                                         if sc.turn_complete:
                                             # Only a completed Gemini turn proves that quota
                                             # access recovered; reconnect success alone does not.
@@ -1925,9 +2015,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                         in_txt, out_txt = [], []
 
                                         tail = resampler.flush()
-                                        if tail:
-                                            S["play_end"] = max(S["play_end"], loop.time()) + len(tail) / BYTES_PER_SEC_OUT
-                                            if not await ws_send_bytes(tail):
+                                        if tail and not turn_was_suppressed:
+                                            if not await send_pcm_paced(tail):
                                                 return
                                         S["is_speaking"] = False
                                         S["mute_until"] = S["play_end"] + POST_PLAYBACK_MUTE_S
@@ -1939,6 +2028,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                             if not await ws_send_json({"event": "conversation_end"}):
                                                 return
                                             S["end_after_turn"] = False
+                                            S["conversation_ended"] = True
                                         if not await ws_send_json({"event": "turn_complete"}):
                                             return
 
@@ -2000,6 +2090,16 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                             try:
                                 kind, data = await asyncio.wait_for(audio_queue.get(), timeout=0.25)
                             except asyncio.TimeoutError:
+                                continue
+
+                            if kind == "interrupt":
+                                # Discard unsent microphone frames from the interrupted turn.
+                                while not audio_queue.empty():
+                                    try:
+                                        audio_queue.get_nowait()
+                                    except asyncio.QueueEmpty:
+                                        break
+                                await ws_send_json({"event": "interrupt_ack"})
                                 continue
 
                             blocked = S["is_speaking"] or loop.time() < S["mute_until"]
@@ -2065,7 +2165,11 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 10.0)
     finally:
-        await delete_conversation_state(doctor_id, connection_id, "pending_patient")
+        # Preserve a short-lived pending duplicate selection after an unplanned
+        # Wi-Fi reconnect. A spoken goodbye/stop explicitly clears it.
+        if S.get("conversation_ended"):
+            await delete_conversation_state(doctor_id, connection_id, "pending_patient")
+            await delete_conversation_state(doctor_id, connection_id, "active_patient")
         esp32_task.cancel()
         await asyncio.gather(esp32_task, return_exceptions=True)
 
@@ -2076,4 +2180,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8008))
     logger.info(f"Starting server on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port, ws_ping_interval=None, ws_ping_timeout=None, timeout_keep_alive=600)
+    uvicorn.run(app, host="0.0.0.0", port=port, ws_ping_interval=20.0, ws_ping_timeout=20.0, timeout_keep_alive=600)
