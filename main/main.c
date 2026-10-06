@@ -5,6 +5,7 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
+#include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
@@ -47,9 +48,9 @@ static const char *TAG = "GEMINI_ASSISTANT";
 #define MIC_HOLDOFF_AFTER_PLAYBACK_MS                                          \
   400 // keep mic muted after speaker stops (room echo tail)
 #define BARGE_IN_THRESHOLD_RMS                                                 \
-  300.0f // deliberate close speech while the speaker is active
+  200.0f // deliberate speech while the speaker is active
 #define BARGE_IN_CONFIRM_CHUNKS                                                \
-  8 // 256 ms prevents normal speaker echo from interrupting
+  5 // 160 ms confirms barge-in speech
 
 // Playback
 #define PLAYBACK_RB_SIZE 65536 // 2.0 s of 16 kHz mono s16
@@ -119,7 +120,7 @@ static inline void buffered_sub(size_t n) {
 static inline size_t buffered_get(void) {
   return __atomic_load_n(&s_buffered_bytes, __ATOMIC_SEQ_CST);
 }
-static inline bool ws_ready(void);
+
 
 static float compute_pcm_rms(const int16_t *pcm_samples, int num_samples) {
   if (num_samples <= 0)
@@ -163,23 +164,38 @@ static void flush_playback_ringbuffer(void) {
   }
 }
 
-// Interrupting is deliberately separate from ending the conversation. It
-// stops current playback immediately and lets the doctor continue speaking.
+// maybe_send_pending_interrupt moved below
+
+static bool pending_interrupt = false;
+static char pending_reason[32] = {0};
+static void maybe_send_pending_interrupt(void);
+// KWS (keyword spotting) disabled – removed unused variables
+static int64_t s_last_interrupt_time_ms = 0;
 static void request_interruption(const char *reason) {
-  if (s_conv_state == CONV_STATE_STANDBY)
+  int64_t now = now_ms();
+  if (s_conv_state == CONV_STATE_STANDBY) {
+    ESP_LOGI(TAG, "⏹️ Interrupt ignored – already standby");
     return;
+  }
+  if (now - s_last_interrupt_time_ms < 500) {
+    ESP_LOGI(TAG, "⏹️ Interrupt already in flight, skipping duplicate");
+    return;
+  }
+  s_last_interrupt_time_ms = now;
   ESP_LOGI(TAG, "⏹️ Interrupt requested (%s)", reason);
+  // Stop any ongoing playback and reset state
   flush_playback_ringbuffer();
   s_playback_ctx.is_playing = false;
   s_conv_state = CONV_STATE_LISTENING;
-  s_last_speech_time_ms = now_ms();
+  s_last_speech_time_ms = now;
   update_led_state(CONV_STATE_LISTENING);
-  if (ws_ready()) {
-    const char *interrupt = "{\"event\":\"interrupt\"}";
-    esp_websocket_client_send_text(s_persistent_ws_client, interrupt,
-                                   strlen(interrupt), pdMS_TO_TICKS(250));
-  }
+  // Queue interrupt for sending
+  pending_interrupt = true;
+  strncpy(pending_reason, reason, sizeof(pending_reason) - 1);
+  // Try to send immediately if WS is ready
+  maybe_send_pending_interrupt();
 }
+
 
 // ==========================================================
 // LED ANIMATION (3 centre LEDs: 2, 3, 4) — runs on Core 0 @ 20 fps
@@ -379,6 +395,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
     ESP_LOGI(TAG, "⚡ Persistent WebSocket connected to relay server");
     if (!s_boot_anim_done) // never fight the LED task once it is running
       rgb_led_set_all(255, 255, 255);
+    // Attempt to send any pending interrupt now that the socket is up
+    maybe_send_pending_interrupt();
     break;
 
   case WEBSOCKET_EVENT_DISCONNECTED:
@@ -481,13 +499,16 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
   }
 
   char ws_url[240];
-  if (strlen(SERVER_PORT) == 0 || strcmp(SERVER_PORT, "80") == 0 ||
-      strcmp(SERVER_PORT, "443") == 0)
+  if (strcmp(SERVER_PORT, "443") == 0) {
+    snprintf(ws_url, sizeof(ws_url), "wss://%s/ws/live/%s?device_id=%s",
+             SERVER_IP, DOCTOR_ID, s_device_id);
+  } else if (strlen(SERVER_PORT) == 0 || strcmp(SERVER_PORT, "80") == 0) {
     snprintf(ws_url, sizeof(ws_url), "ws://%s/ws/live/%s?device_id=%s",
              SERVER_IP, DOCTOR_ID, s_device_id);
-  else
+  } else {
     snprintf(ws_url, sizeof(ws_url), "ws://%s:%s/ws/live/%s?device_id=%s",
              SERVER_IP, SERVER_PORT, DOCTOR_ID, s_device_id);
+  }
 
   ESP_LOGI(TAG, "Connecting WebSocket: %s", ws_url);
 
@@ -498,6 +519,9 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
       .network_timeout_ms = 8000,
       .ping_interval_sec = 5,
       .pingpong_timeout_sec = 10,
+      .crt_bundle_attach = esp_crt_bundle_attach,
+      .skip_cert_common_name_check = true,
+      .headers = "ngrok-skip-browser-warning: 1\r\nUser-Agent: ESP32\r\n",
   };
 
   s_persistent_ws_client = esp_websocket_client_init(&ws_cfg);
@@ -532,6 +556,31 @@ static inline bool ws_ready(void) {
   return s_ws_connected && s_persistent_ws_client &&
          esp_websocket_client_is_connected(s_persistent_ws_client);
 }
+
+static void maybe_send_pending_interrupt(void) {
+  if (!pending_interrupt) return;
+  const char *interrupt = "{\"event\":\"interrupt\"}";
+  int len = strlen(interrupt);
+  // Try a few times, aborting if the WebSocket is not ready.
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    if (!ws_ready()) {
+      ESP_LOGW(TAG, "⏹️ WebSocket not ready – will retry on next reconnect");
+      return; // keep pending_interrupt true so it will be retried later
+    }
+    int res = esp_websocket_client_send_text(s_persistent_ws_client, interrupt,
+                                            len, pdMS_TO_TICKS(250));
+    if (res >= 0) {
+      ESP_LOGI(TAG, "📤 Pending interrupt sent successfully (%s)", pending_reason);
+      pending_interrupt = false;
+      return;
+    }
+    ESP_LOGW(TAG, "⏹️ Pending interrupt send failed (attempt %d err=%d), retrying", attempt + 1, res);
+    vTaskDelay(pdMS_TO_TICKS(100)); // short back‑off before next attempt
+  }
+  ESP_LOGW(TAG, "⏹️ Giving up after retries – will retry on next reconnect");
+}
+
+
 
 // Keep network recovery off the real-time microphone task. A reconnect can
 // take seconds; doing it inline would stop mic capture and lose the rest of
@@ -593,14 +642,19 @@ static void continuous_mic_stream_task(void *pvParameters) {
       continue;
     }
 
-    // ES7210 2ch/32-bit -> mono 16-bit (louder channel wins)
+    // ES7210 2ch/32-bit -> mono 16-bit (smooth stereo mix)
     for (int i = 0; i < chunk_samples; i++) {
-      int16_t ch0 = (int16_t)(raw_chunk[CHANNELS * i + 0] >> 16);
-      int16_t ch1 = (int16_t)(raw_chunk[CHANNELS * i + 1] >> 16);
-      chunk_mono[i] = (abs(ch1) > abs(ch0)) ? ch1 : ch0;
+      int32_t ch0 = (int32_t)(raw_chunk[CHANNELS * i + 0] >> 16);
+      int32_t ch1 = (int32_t)(raw_chunk[CHANNELS * i + 1] >> 16);
+      chunk_mono[i] = (int16_t)((ch0 + ch1) / 2);
     }
 
     float rms = compute_pcm_rms(chunk_mono, chunk_samples);
+    // ----------------------------------------------------------
+    // Keyword spotting – trigger interrupt on "assistant"
+    // ----------------------------------------------------------
+    // Keyword spotting disabled – RMS based detection only
+
     int64_t t = now_ms();
 
     // 1. While speaking, accept only sustained loud close-range speech as an
@@ -608,6 +662,7 @@ static void continuous_mic_stream_task(void *pvParameters) {
     if (s_conv_state == CONV_STATE_SPEAKING) {
       if (rms >= BARGE_IN_THRESHOLD_RMS &&
           ++barge_hits >= BARGE_IN_CONFIRM_CHUNKS) {
+        // Gracefully request interruption; reason logged for debugging
         request_interruption("voice barge-in");
         barge_hits = 0;
       } else if (rms < BARGE_IN_THRESHOLD_RMS) {

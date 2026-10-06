@@ -531,6 +531,11 @@ def build_doctor_agent_prompt(
         "strictly in natural, conversational spoken English. NEVER read out, spell out, or mention any "
         "URLs, links, domain names, file extensions, raw JSON syntax, slashes, or raw ratios. Always "
         "translate numbers and dates into natural spoken words (e.g. '2000 calories', 'July 5th, 1995').\n"
+        "AUDIO & MEDICAL TERMINOLOGY RECOGNITION:\n"
+        "   - The audio stream is from a doctor in a clinical setting speaking medical terms, acronyms, and lab test names.\n"
+        "   - Interpret phonetic approximations accurately: spoken phrases that sound like 'b1', 'h b a 1 c', 'a 1 c', 'h b 1 c', or 'hba1c' refer to HbA1c (Hemoglobin A1c).\n"
+        "   - Terms sounding like 'bp' refer to blood pressure, 'bmi' to Body Mass Index, 'mg/dL' to milligrams per deciliter, etc.\n"
+        "   - Always map these spoken medical terms to the corresponding fields in the PATIENT PERSONA RECORD.\n"
         "CRITICAL: Never append boilerplate or disclaimers (e.g. 'please verify independently', 'this "
         "is not medical advice') to routine answers. The doctor is the licensed clinician — give "
         "direct, grounded answers only.\n\n"
@@ -1761,21 +1766,15 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                 elif message.get("text"):
                     text = message["text"]
                     if "interrupt" in text:
-                        # The device has already discarded queued speaker audio.
-                        # Do the same on the relay and wait for Gemini to mark
-                        # the old turn interrupted before accepting its output.
+                        # Stop assistant speaker playback immediately on interrupt,
+                        # but keep all microphone audio chunks so the user's question is preserved.
                         streaming = False
                         S["suppress_output"] = True
                         S["is_speaking"] = False
                         S["turn_pending"] = False
                         S["mute_until"] = 0.0
                         S["play_end"] = loop.time()
-                        while not audio_queue.empty():
-                            try:
-                                audio_queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
-                        logger.info("⏹️ Device requested a voice/button interrupt")
+                        logger.info("⏹️ Device requested a voice barge-in interrupt")
                         await queue_put(("interrupt", None))
                     elif "audio_end" in text:
                         streaming = False
@@ -1976,6 +1975,9 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
 
                                     if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
                                         in_txt.append(sc.input_transcription.text)
+                                        if S["suppress_output"]:
+                                            S["suppress_output"] = False
+                                            logger.info("✅ Reset suppress_output for user's new interrupted question")
                                     if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
                                         out_txt.append(sc.output_transcription.text)
 
@@ -2019,7 +2021,10 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                             if not await send_pcm_paced(tail):
                                                 return
                                         S["is_speaking"] = False
-                                        S["mute_until"] = S["play_end"] + POST_PLAYBACK_MUTE_S
+                                        if not turn_was_suppressed:
+                                            S["mute_until"] = S["play_end"] + POST_PLAYBACK_MUTE_S
+                                        else:
+                                            S["mute_until"] = 0.0
                                         S["last_activity"] = loop.time()
                                         logger.info(f"✅ [Turn {'Interrupted' if sc.interrupted else 'Complete'}] "
                                                     f"(~{max(0.0, S['play_end'] - loop.time()):.1f}s of audio still playing on device)")
@@ -2093,12 +2098,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                 continue
 
                             if kind == "interrupt":
-                                # Discard unsent microphone frames from the interrupted turn.
-                                while not audio_queue.empty():
-                                    try:
-                                        audio_queue.get_nowait()
-                                    except asyncio.QueueEmpty:
-                                        break
+                                # Send interrupt_ack to ESP32 to stop DAC playback,
+                                # without discarding the user's spoken audio chunks.
                                 await ws_send_json({"event": "interrupt_ack"})
                                 continue
 
@@ -2115,8 +2116,6 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                     logger.warning(f"Gemini send error: {e}. Reconnecting...")
                                     break
                             elif kind == "turn_end":
-                                if blocked:
-                                    continue
                                 S["last_activity"] = loop.time()
                                 S["last_rx"] = loop.time()
                                 S["turn_pending"] = True
