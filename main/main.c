@@ -44,7 +44,7 @@ static const char *TAG = "GEMINI_ASSISTANT";
 #define MIN_SPEECH_DURATION_MS 200 // ignore blips shorter than this
 #define SILENCE_TIMEOUT_MS 1000    // trailing silence => utterance finished
 #define IDLE_STANDBY_TIMEOUT_S 30  // inactivity => Standby
-#define GEMINI_RESPONSE_TIMEOUT_MS 45000
+#define GEMINI_RESPONSE_TIMEOUT_MS 12000
 #define MIC_HOLDOFF_AFTER_PLAYBACK_MS                                          \
   400 // keep mic muted after speaker stops (room echo tail)
 #define BARGE_IN_THRESHOLD_RMS                                                 \
@@ -450,8 +450,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
       if (s_turn_complete && !s_playback_ctx.is_playing && buffered_get() == 0)
         s_turn_complete = false;
       s_last_audio_rx_ms = now_ms();
-      s_last_speech_time_ms =
-          s_last_audio_rx_ms; // keeps THINKING/idle timers alive
+      // NOTE: do NOT update s_last_speech_time_ms here. Incoming audio must
+      // not reset the THINKING-state timeout — if the ring overflows and audio
+      // keeps arriving, the device would stay stuck in THINKING forever.
+      // s_last_speech_time_ms is owned by the mic / utterance path only.
       enqueue_audio((const uint8_t *)data->data_ptr, (size_t)data->data_len);
     }
     break;
@@ -657,17 +659,9 @@ static void continuous_mic_stream_task(void *pvParameters) {
 
     int64_t t = now_ms();
 
-    // 1. While speaking, accept only sustained loud close-range speech as an
-    // interrupt. Normal audio from our own speaker remains ignored.
+    // 1. While speaking, ignore ALL mic input so Lira finishes her sentence.
+    //    Barge-in is disabled — the doctor must wait for the response to end.
     if (s_conv_state == CONV_STATE_SPEAKING) {
-      if (rms >= BARGE_IN_THRESHOLD_RMS &&
-          ++barge_hits >= BARGE_IN_CONFIRM_CHUNKS) {
-        // Gracefully request interruption; reason logged for debugging
-        request_interruption("voice barge-in");
-        barge_hits = 0;
-      } else if (rms < BARGE_IN_THRESHOLD_RMS) {
-        barge_hits = 0;
-      }
       speech_accum_ms = silence_accum_ms = 0;
       pre_chunks = wake_hits = 0;
       continue;
@@ -916,7 +910,7 @@ void app_main(void) {
     rgb_led_set_all(255, 0, 0);
     return;
   }
-  xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 10240, NULL,
+  xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 6144, NULL,
                           10, NULL, 1);
   xTaskCreatePinnedToCore(gpio_button_task, "gpio_button_task", 6144, NULL, 4,
                           NULL, 0);
@@ -946,10 +940,10 @@ void app_main(void) {
   xTaskCreatePinnedToCore(websocket_maintenance_task, "ws_maintenance_task",
                           4096, NULL, 4, NULL, 0);
 
-  ESP_LOGI(TAG, "✅ Free heap: %lu bytes",
+  xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 6144,
+                          NULL, 9, NULL, 1);
+
+  ESP_LOGI(TAG, "✅ Free heap after all tasks: %lu bytes",
            (unsigned long)esp_get_free_heap_size());
   ESP_LOGI(TAG, "System ready.");
-
-  xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 8192,
-                          NULL, 9, NULL, 1);
 }

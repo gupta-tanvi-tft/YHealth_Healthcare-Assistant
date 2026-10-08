@@ -1838,26 +1838,21 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                 text_to_pcm_16k(text, mood="calm_reassuring"), timeout=12.0
             )
             pcm = pcm[:len(pcm) & ~1]  # Keep signed 16-bit PCM frame-aligned.
-            if not pcm:
+            if pcm:
+                if await send_pcm_paced(pcm):
+                    S["mute_until"] = S["play_end"] + POST_PLAYBACK_MUTE_S
+                    logger.info("Spoke %s status announcement", "progress" if progress else "final")
+            else:
                 logger.warning("Status announcement TTS returned no audio")
-                return False
-
-            if not await send_pcm_paced(pcm):
-                return False
-
-            S["mute_until"] = S["play_end"] + POST_PLAYBACK_MUTE_S
-            event = {"event": "status_audio_end"} if progress else {"event": "turn_complete"}
-            if not await ws_send_json(event):
-                return False
-            logger.info("Spoke %s status announcement", "progress" if progress else "final")
-            return True
         except asyncio.TimeoutError:
             logger.warning("Status announcement TTS timed out")
-            return False
         except Exception as exc:
             logger.warning("Status announcement failed (%s)", type(exc).__name__)
-            return False
         finally:
+            event = {"event": "status_audio_end"} if progress else {"event": "turn_complete"}
+            await ws_send_json(event)
+            S["is_speaking"] = False
+            return True
             S["is_speaking"] = previous_speaking_state if progress else False
             S["last_activity"] = loop.time()
 
@@ -2103,7 +2098,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                 await ws_send_json({"event": "interrupt_ack"})
                                 continue
 
-                            blocked = S["is_speaking"] or loop.time() < S["mute_until"]
+                            blocked = S["is_speaking"]
                             if kind == "audio":
                                 S["last_activity"] = loop.time()
                                 if blocked:

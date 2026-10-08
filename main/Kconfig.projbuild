@@ -2,25 +2,25 @@ menu "Gemini Assistant Configuration"
 
     config ASSISTANT_WIFI_SSID
         string "Primary WiFi SSID"
-        default "YOUR_WIFI_SSID"
+        default "TFTus-WiFi"
         help
             Primary SSID of the WiFi network to connect to.
 
     config ASSISTANT_WIFI_PASSWORD
         string "Primary WiFi Password"
-        default "YOUR_WIFI_PASSWORD"
+        default "TFTus@123#$"
         help
             Password of the primary WiFi network.
 
     config ASSISTANT_WIFI_SSID_ALT
         string "Fallback WiFi SSID"
-        default "YOUR_WIFI_SSID"
+        default "TFTus-WiFi"
         help
             Fallback SSID if primary fails or drops.
 
     config ASSISTANT_WIFI_PASSWORD_ALT
         string "Fallback WiFi Password"
-        default "YOUR_WIFI_PASSWORD"
+        default "TFTus@123#$"
         help
             Password of the fallback WiFi network.
 
