@@ -1,54 +1,23 @@
-# Comprehensive System Optimization & Bug Fix Documentation
+# System Optimization and Fixes Summary
 
-## Executive Overview
-This document provides a bulleted, professional summary of all architectural analysis, root-cause diagnostics, FreeRTOS memory fixes, build path resolutions, and performance optimizations implemented for the **ESP32-S3 Gemini Live Full-Duplex Voice Assistant**.
+This document summarizes the system stability patches, network optimizations, and hardware/software configurations applied to the YHealth Healthcare Assistant.
 
----
+## 1. ESP32 Firmware Stability (`main.c`)
+- **Memory Allocation Fixed**: Reduced the `PLAYBACK_RB_SIZE` (Ring Buffer) from 96 KB down to a safe 64 KB, and trimmed the FreeRTOS task stacks. This freed up over 6 KB of critical heap RAM, eliminating silent "Out of Memory" crashes when the microphone DMA initialized.
+- **Deadlock Timeout Fixed**: Reduced `GEMINI_RESPONSE_TIMEOUT_MS` from 45 seconds to 12 seconds. If the backend fails to respond, the ESP32 will now automatically break out of the `THINKING` state after 12 seconds instead of hanging permanently.
 
-## 1. Voice Jitter & Audio Stuttering Diagnostic Analysis
+## 2. Server Backend Robustness (`server.py`)
+- **TTS Crash Deadlock Fixed**: Modified the `speak_status_announcement` function to use a strict `finally:` block. Previously, if the local text-to-speech engine (`edge-tts`) crashed due to a VPS network glitch, the server forgot to send the `turn_complete` signal to the ESP32. This was the primary cause of the "stuck in cyan thinking mode" bug. The `turn_complete` signal is now strictly guaranteed.
+- **Audio Pacing Fixed**: Corrected an aggressive `mute_until` software gate that was accidentally dropping the doctor's follow-up questions if they spoke too quickly after the assistant finished.
+- **Network Jitter Buffers Tuned**: Updated `.env` variables (`PLAYBACK_MAX_LEAD_S=1.0` and `PLAYBACK_TARGET_LEAD_S=0.6`) to force the server to push a larger 600ms audio buffer to the ESP32. This absorbs network latency spikes on the public internet, preventing stuttering audio.
 
-A comprehensive technical analysis document ([`voice_jitter_technical_details.md`](file:///c:/Users/tanvi-admin/Downloads/gemini_voice_assistant_fixed/gemini_voice_assistant_fixed/voice_jitter_technical_details.md)) was generated to isolate the root causes of sudden high voice jitter and playback micro-stutters.
+## 3. Server Infrastructure (`nginx_speaker.conf`)
+- **Proxy Buffering Disabled**: Reverse proxies like Nginx default to holding incoming TCP packets until a 4KB/8KB buffer is full. This destroyed real-time audio streaming. Configured Nginx with `proxy_buffering off;` and `tcp_nodelay on;` to ensure binary audio chunks are fired to the ESP32 instantly.
+- **Keep-Alive Extended**: Set `proxy_read_timeout 3600s;` to prevent Nginx from severing the WebSocket connection during long periods of silence (e.g., when the doctor is pausing or the API is looking up a patient).
 
-### Identified Root Causes:
-- **100ms FreeRTOS Ringbuffer Block (`pdMS_TO_TICKS(100)`)**:
-  - In `main.c`, `xRingbufferReceive()` blocked for up to **100ms** when the ringbuffer briefly hit 0 bytes during minor Wi-Fi network variance.
-  - This caused instant DAC audio starvation (physical silence clicks/gaps).
-- **Python `asyncio.sleep` Pacing Accumulation**:
-  - In `server.py`, pacing calculations derived `lead_time` cumulatively over multi-second turns. Combined with Windows OS timer resolution (~15.6ms), this created alternating cycles of packet bursting and multi-hundred-millisecond pauses.
-- **800ms Robotic Stutter Window**:
-  - Mid-sentence buffer underruns waited **800ms** before resetting pre-buffering. Chunks arriving during this window were written immediately without cushion, causing harsh micro-stuttering.
-- **TCP Packet Coalescing (Nagle Algorithm)**:
-  - Default socket behavior coalesced small PCM frames into 1460-byte MTU bursts separated by 50–150ms delays.
-
----
-
-## 2. Firmware Bug Fixes & Memory Hardening
-
-### FreeRTOS Stack Overflow Crash Resolution
-- **Symptom**: ESP32 crashed with `vApplicationStackOverflowHook` and rebooted during audio playback, causing Wi-Fi disconnection (`Connection reset by peer`, `errno = 104`).
-- **Root Cause**: In `main.c`, `audio_playback_task` allocated `uint8_t zero_silence[1024]` directly on the task stack, consuming 25% of the total 4,096-byte task stack. Calling `esp_codec_dev_write()` exceeded stack boundaries.
-- **Fixes Applied in [`main.c`](file:///c:/Users/tanvi-admin/Downloads/gemini_voice_assistant_fixed/gemini_voice_assistant_fixed/main/main.c)**:
-  - **Moved Silence Buffer to Static Flash Memory**: Changed `uint8_t zero_silence[1024]` to `static const uint8_t zero_silence[1024]`, freeing 1,024 bytes of stack space.
-  - **Expanded Task Stack**: Increased `audio_play_task` stack size from **4,096 bytes** to **8,192 bytes** (`xTaskCreatePinnedToCore`).
-
----
-
-## 3. Directory & Environment Build Resolutions
-
-- **Nested Directory Context (`CMakeLists.txt not found`)**:
-  - Resolved `idf.py` execution failure by establishing that the ESP-IDF build root is located at `gemini_voice_assistant_fixed\gemini_voice_assistant_fixed`.
-- **Backend Directory Context**:
-  - Resolved Python module execution errors by providing explicit instructions to run `server.py` within `backend/backend`.
-
----
-
-## 4. End-to-End System Specifications Matrix
-
-| Component | Technical Detail | Configuration Value |
-|---|---|---|
-| **Microcontroller** | ESP32-S3 Dual-Core Xtensa LX7 | 240 MHz, Core 0 (Wi-Fi/Controls), Core 1 (Audio Tasks) |
-| **Audio DAC Codec** | ES8311 (I2S Output) | 16 kHz, 16-bit Signed PCM, Mono |
-| **Audio ADC Codec** | ES7210 (I2S Input) | 16 kHz, 16-bit Signed PCM, 4-Mic Array TDM |
-| **FreeRTOS Playback Ringbuffer** | `s_audio_play_rb` (ByteBuf) | 65,536 Bytes (~2.0s Audio Cushion) |
-| **Pre-buffer Cushion** | `PLAYBACK_PREBUFFER_BYTES` | 9,600 Bytes (~300ms Cushion) |
-| **Backend Pacing & Resampler** | Python FastAPI / `google-genai` | Studio Polyphase 24kHz -> 16kHz 4-Point Cubic Hermite |
+## 4. Hardware Limitations & Future Upgrades
+- **Power Brownouts**: Running the speaker volume at 70%+ draws high peak current. Standard laptop USB ports cannot supply enough current, causing the ESP32 to reboot (`ClearCommError`). A dedicated 5V 2A wall adapter is required for high-volume playback.
+- **Voice Barge-in & AEC**: 
+  - **The Hardware**: The board features an ES7210 4-channel ADC with dual digital microphones, which is fully capable of Acoustic Echo Cancellation (AEC).
+  - **The Software**: The current `main.c` firmware lacks a DSP pipeline. It uses a "State Mute" approach to avoid feedback loops, which explicitly disables the microphone while the speaker is playing.
+  - **The Upgrade Path**: To enable true voice barge-in, the C firmware must be refactored to use the **Espressif Audio Development Framework (ESP-ADF)**. The `ES8311` DAC playback stream must be fed into the `ESP-AEC` software algorithm as a reference signal, which will use the ESP32-S3's DSP to mathematically subtract Lira's voice from the `ES7210` microphone feed in real-time. Until then, the tactile BOOT button must be used to interrupt the assistant.

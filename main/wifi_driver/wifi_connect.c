@@ -8,6 +8,11 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+
+static char s_nvs_ssid[33] = {0};
+static char s_nvs_pass[65] = {0};
+static bool s_has_nvs_wifi = false;
 
 static const char *TAG = "wifi_connect";
 
@@ -110,8 +115,26 @@ esp_err_t wifi_init_sta(void)
             .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
         },
     };
-    strncpy((char *)wifi_config.sta.ssid, s_ssids[0], sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password, s_passes[0], sizeof(wifi_config.sta.password));
+    // Check if custom Wi-Fi credentials were flashed via USB / NVS
+    nvs_handle_t nvs_h;
+    if (nvs_open("storage", NVS_READONLY, &nvs_h) == ESP_OK) {
+        size_t ssid_len = sizeof(s_nvs_ssid);
+        size_t pass_len = sizeof(s_nvs_pass);
+        if (nvs_get_str(nvs_h, "wifi_ssid", s_nvs_ssid, &ssid_len) == ESP_OK && strlen(s_nvs_ssid) > 0) {
+            nvs_get_str(nvs_h, "wifi_pass", s_nvs_pass, &pass_len);
+            s_has_nvs_wifi = true;
+            ESP_LOGI(TAG, "Loaded custom Wi-Fi from NVS Flash (USB Provisioned): SSID='%s'", s_nvs_ssid);
+        }
+        nvs_close(nvs_h);
+    }
+
+    if (s_has_nvs_wifi) {
+        strncpy((char *)wifi_config.sta.ssid, s_nvs_ssid, sizeof(wifi_config.sta.ssid));
+        strncpy((char *)wifi_config.sta.password, s_nvs_pass, sizeof(wifi_config.sta.password));
+    } else {
+        strncpy((char *)wifi_config.sta.ssid, s_ssids[0], sizeof(wifi_config.sta.ssid));
+        strncpy((char *)wifi_config.sta.password, s_passes[0], sizeof(wifi_config.sta.password));
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));

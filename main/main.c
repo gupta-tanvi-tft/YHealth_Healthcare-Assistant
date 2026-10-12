@@ -12,6 +12,8 @@
 #include "freertos/task.h"
 #include "rgb_led_driver.h"
 #include "wifi_connect.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -870,6 +872,32 @@ static void gpio_button_task(void *pvParameters) {
   }
 }
 
+// Background task listening for USB Serial commands from Fleet Dashboard
+static void usb_serial_listener_task(void *pvParameters) {
+  char line[128];
+  while (1) {
+    if (fgets(line, sizeof(line), stdin) != NULL) {
+      char ssid[33] = {0};
+      char pass[65] = {0};
+      if (sscanf(line, "SET_WIFI:%32[^:]:%64[^\r\n]", ssid, pass) >= 1) {
+        ESP_LOGI(TAG, "⚡ Received Wi-Fi credentials via USB: SSID='%s'", ssid);
+        nvs_handle_t nvs_h;
+        if (nvs_open("storage", NVS_READWRITE, &nvs_h) == ESP_OK) {
+          nvs_set_str(nvs_h, "wifi_ssid", ssid);
+          nvs_set_str(nvs_h, "wifi_pass", pass);
+          nvs_commit(nvs_h);
+          nvs_close(nvs_h);
+          printf("OK:WIFI_SAVED\n");
+          fflush(stdout);
+          vTaskDelay(pdMS_TO_TICKS(600));
+          esp_restart();
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 // ==========================================================
 // MAIN
 // ==========================================================
@@ -882,6 +910,14 @@ void app_main(void) {
   ESP_LOGI(TAG, "   • BOOT / Button 3: manual start-stop, Buttons 1&2: volume");
 
   ESP_ERROR_CHECK(esp_board_init(SAMPLE_RATE, 1, 16));
+
+  esp_err_t nvs_ret = nvs_flash_init();
+  if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    nvs_ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(nvs_ret);
+
   rgb_led_init();
   rgb_led_set_all(0, 200, 255); // Sky Blue: booting
   vTaskDelay(pdMS_TO_TICKS(300));
@@ -913,6 +949,8 @@ void app_main(void) {
   xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 6144, NULL,
                           10, NULL, 1);
   xTaskCreatePinnedToCore(gpio_button_task, "gpio_button_task", 6144, NULL, 4,
+                          NULL, 0);
+  xTaskCreatePinnedToCore(usb_serial_listener_task, "usb_serial_task", 3072, NULL, 2,
                           NULL, 0);
 
   ESP_LOGI(TAG, "Connecting to Wi-Fi...");

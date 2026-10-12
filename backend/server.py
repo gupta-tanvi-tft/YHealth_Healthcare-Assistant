@@ -358,6 +358,46 @@ def read_root():
     }
 
 
+@app.get("/api/clinical-notes")
+async def get_clinical_notes(patient_name: str = None, doctor_id: str = None):
+    """Retrieve dictated clinical notes persisted during doctor rounds."""
+    if patient_name:
+        notes = _clinical_notes.get(patient_name, [])
+        return {"patient_name": patient_name, "notes": notes, "count": len(notes)}
+    # Flat list sorted newest first
+    all_notes = []
+    for p_name, notes_list in _clinical_notes.items():
+        for note in notes_list:
+            if isinstance(note, dict):
+                all_notes.append({**note, "patient_name": p_name})
+            else:
+                all_notes.append({"patient_name": p_name, "note": note, "timestamp": datetime.now().isoformat()})
+    all_notes.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    return {"notes": all_notes, "total": len(all_notes)}
+
+
+@app.post("/api/clinical-notes")
+async def save_clinical_note_api(payload: dict):
+    """Save or update clinical notes manually via dashboard or external EHR webhook."""
+    p_name = payload.get("patient_name", "").strip()
+    content = payload.get("note_content") or payload.get("note", "")
+    author = payload.get("author", "Dr. Samarth Gupta")
+    category = payload.get("category", "General")
+    if not p_name or not content:
+        raise HTTPException(status_code=400, detail="patient_name and note_content are required")
+    record = {
+        "id": str(uuid.uuid4())[:8],
+        "note": content,
+        "author": author,
+        "category": category,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "dashboard_writeback"
+    }
+    _clinical_notes.setdefault(p_name, []).append(record)
+    return {"status": "success", "saved": record}
+
+
+
 # ==========================================================
 # PERSONA HELPERS
 # ==========================================================
@@ -521,16 +561,21 @@ def build_doctor_agent_prompt(
 
     return (
         "STRICT HUMAN VOICE INTELLIGENCE & CLINICAL ASSISTANT INSTRUCTIONS:\n"
-        f"You are YHealth Assist, a clinical AI coordinator speaking directly with Dr. {doctor_name}, "
+        f"You are YHealth Assist, a multilingual clinical AI coordinator speaking directly with Dr. {doctor_name}, "
         f"{specialization}. You support the doctor's clinical workflow by retrieving and discussing "
-        "patient records, hands-free, during their consultations.\n"
+        "patient records, hands-free, during their consultations.\n\n"
+        "MULTILINGUAL & CODE-SWITCHING MANDATE (TOP PRIORITY):\n"
+        "   - You are completely fluent in Hindi (हिन्दी), Hinglish, and English. You CAN and MUST speak Hindi and Hinglish whenever addressed in those languages or requested.\n"
+        "   - If the doctor speaks Hindi, reply naturally in Hindi (e.g. 'जी डॉक्टर गुप्ता, प्रिया शर्मा का ब्लड शुगर 140 है।').\n"
+        "   - If the doctor speaks in Hinglish, reply in natural Hinglish.\n"
+        "   - If the doctor asks 'Can you speak in Hindi?' or 'हिंदी में बोलो', say: 'हाँ डॉक्टर, मैं हिन्दी में बात कर सकता हूँ। आप किस मरीज़ के बारे में जानना चाहते हैं?'\n"
+        "   - NEVER SAY 'I cannot speak Hindi' or 'I only speak English'. You have full native speech generation capabilities in Hindi.\n\n"
         "SPEAKING STYLE: Speak at a calm, natural, measured pace — like a composed colleague, never "
         "rushed. Pause briefly between sentences. Always finish every sentence completely; never trail "
         "off or cut yourself short. Keep answers brief but complete. No shouting or abrupt tone changes.\n"
-        "CRITICAL VOICE & URL FORMATTING RULE: You are speaking over a live voice connection. Speak "
-        "strictly in natural, conversational spoken English. NEVER read out, spell out, or mention any "
-        "URLs, links, domain names, file extensions, raw JSON syntax, slashes, or raw ratios. Always "
-        "translate numbers and dates into natural spoken words (e.g. '2000 calories', 'July 5th, 1995').\n"
+        "CRITICAL VOICE & URL FORMATTING RULE: You are speaking over a live voice connection. NEVER read out, "
+        "spell out, or mention any URLs, links, domain names, file extensions, raw JSON syntax, slashes, or raw ratios. "
+        "Always translate numbers and dates into natural spoken words.\n"
         "AUDIO & MEDICAL TERMINOLOGY RECOGNITION:\n"
         "   - The audio stream is from a doctor in a clinical setting speaking medical terms, acronyms, and lab test names.\n"
         "   - Interpret phonetic approximations accurately: spoken phrases that sound like 'b1', 'h b a 1 c', 'a 1 c', 'h b 1 c', or 'hba1c' refer to HbA1c (Hemoglobin A1c).\n"
@@ -589,6 +634,11 @@ def build_doctor_agent_prompt(
         "- If asked something outside the patient's record or your role, say plainly that it's outside "
         "what you can confirm from this record.\n\n"
 
+        "LANGUAGE & MULTILINGUAL CAPABILITIES:\n"
+        "   - You are a fully fluent multilingual clinical assistant supporting English, Hindi (हिन्दी), Hinglish, Tamil, Telugu, Kannada, Bengali, Marathi, Gujarati, Spanish, and other standard languages.\n"
+        "   - Code-Switching & Natural Mirroring: Always detect and respond in the exact language the doctor uses. If the doctor speaks Hindi, reply in fluent, natural Hindi. If they speak in Hinglish (mixed Hindi-English), reply naturally in Hinglish while retaining medical terminology. If they request a specific language (e.g. 'Speak in Hindi' or 'हिंदी में बताओ'), switch immediately.\n"
+        "   - Never state or claim language limitations or say 'I cannot speak Hindi'. You have full native speech generation capabilities in all supported languages.\n"
+        "   - Pronounce medical metrics clearly (e.g., 'रक्तचाप 130 बटा 85', 'ब्लड शुगर 140 मिलीग्राम प्रति डेसीलीटर').\n\n"
         "DOCTOR CONTEXT:\n"
         f"Name: Dr. {doctor_name}\n"
         f"Specialization: {specialization}\n\n"
@@ -1292,10 +1342,20 @@ async def run_tool(fn: str, args: dict, doctor_id: str = None, connection_id: st
                 timeout=TOOL_TIMEOUT_S,
             )
         if fn == "add_clinical_note":
-            pn, nc = args.get("patient_name", ""), args.get("note_content", "")
-            logger.info(f"📝 add_clinical_note: '{pn}' -> '{nc}'")
-            _clinical_notes.setdefault(pn, []).append(nc)
-            return {"status": "success", "message": f"Note saved for {pn}."}
+            pn = args.get("patient_name", "").strip()
+            nc = args.get("note_content", "").strip()
+            category = args.get("category", "Consultation Note")
+            logger.info(f"📝 add_clinical_note: '{pn}' -> '{nc}' (category={category})")
+            note_obj = {
+                "id": str(uuid.uuid4())[:8],
+                "note": nc,
+                "author": f"Dr. {os.getenv('DEFAULT_DOCTOR_NAME', 'Samarth Gupta')}",
+                "category": category,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "voice_speaker_relay"
+            }
+            _clinical_notes.setdefault(pn, []).append(note_obj)
+            return {"status": "success", "message": f"Clinical note successfully saved for {pn}."}
         if fn == "escalate_alert":
             pn, at = args.get("patient_name", ""), args.get("alert_type", "")
             logger.info(f"🚨 escalate_alert: '{pn}' -> '{at}'")
@@ -1594,8 +1654,12 @@ def build_live_tools(types):
            "Use only after load_patient_record returned ambiguous. Matches exactly four spoken digits against the pending duplicate-name candidates in the cached roster. Phone digits are never returned.",
            {"last_four": S(type=T.STRING, description="Exactly the last four digits spoken by the doctor.")}, ["last_four"]),
         fd("add_clinical_note",
-           "Save a clinical note dictated by the doctor for the current patient.",
-           {"patient_name": S(type=T.STRING), "note_content": S(type=T.STRING)},
+           "Save a clinical note, consultation observation, or medication/diet order dictated by the doctor for the active patient.",
+           {
+               "patient_name": S(type=T.STRING, description="The name of the patient this clinical note applies to."),
+               "note_content": S(type=T.STRING, description="The verbatim or summarized clinical observation, prescription change, or instruction dictated by the doctor."),
+               "category": S(type=T.STRING, description="Optional note category, e.g. 'Prescription Change', 'Lab Order', 'Diet & Lifestyle', 'Follow-up', or 'General Consultation'.")
+           },
            ["patient_name", "note_content"]),
         fd("escalate_alert",
            "Send an alert or notification to the current patient.",
@@ -1851,10 +1915,9 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         finally:
             event = {"event": "status_audio_end"} if progress else {"event": "turn_complete"}
             await ws_send_json(event)
-            S["is_speaking"] = False
-            return True
             S["is_speaking"] = previous_speaking_state if progress else False
             S["last_activity"] = loop.time()
+        return True
 
     backoff, fail_count = 1.0, 0
     target_model = FALLBACK_LIVE_MODELS[0]

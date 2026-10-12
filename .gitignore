@@ -33,3 +33,9 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Node / Frontend Artifacts
+node_modules/
+dist/
+.vite/
+
