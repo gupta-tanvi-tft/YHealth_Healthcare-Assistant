@@ -16,8 +16,8 @@ The live voice flow uses API 1 and API 2. `backend/patient_persona.json` is not 
 | ESP-IDF firmware | ESP32-S3 | Voice activity detection, mono PCM framing, persistent WebSocket, playback buffering, buttons, status LEDs, reconnect handling. |
 | FastAPI relay | PC or server | Owns the device WebSocket, connects to Gemini Live, calls API 1/API 2, manages lookup state and Redis cache, and streams audio to/from the device. |
 | Gemini Live | Google service | Interprets streamed speech, decides when to call backend tools, generates conversational text/audio, and returns turn-completion events. |
-| API 1 | `200.97.162.162:8000` | Returns the patient roster for the configured doctor. |
-| API 2 | `200.97.162.162:8000` | Returns the persona for the selected patient ID. |
+| API 1 | `https://ychat-be.yhealth.me` | Returns the patient roster for the configured doctor. |
+| API 2 | `https://ychat-be.yhealth.me` | Returns the persona for the selected patient ID. |
 | Redis | Local Redis or remote Redis-compatible service | Caches roster/personas and stores short-lived patient-selection state and verified ID mappings. |
 
 ```mermaid
@@ -39,8 +39,8 @@ The API server and the voice relay are separate services. The API host is not th
 
 | Link | Current configuration | Meaning |
 |---|---|---|
-| API 1 roster | `http://200.97.162.162:8000/agent/patients/{doctor_id}` | Backend-to-patient-service HTTP request. |
-| API 2 persona | `http://200.97.162.162:8000/persona-hardware/{patient_id}` | Backend-to-persona-service HTTP request authenticated with the configured hardware token. The patient ID comes from the selected API 1 row or a verified mapping. |
+| API 1 roster | `https://ychat-be.yhealth.me/agent/patients/{doctor_id}` | Backend-to-patient-service HTTP request. |
+| API 2 persona | `https://ychat-be.yhealth.me/persona-hardware/{patient_id}` | Backend-to-persona-service HTTP request authenticated with the configured hardware token. The patient ID comes from the selected API 1 row or a verified mapping. |
 | Device WebSocket | `ws://<backend-host>:8008/ws/live/<doctor-id>` | ESP32-to-backend connection. Configure the host and doctor ID for your deployment. |
 
 The doctor ID in the WebSocket path identifies the doctor/session. The configured `PATIENTS_API_DOCTOR_ID` identifies which roster API 1 should return. They are currently configured to the same ID, but are separate settings so they can be changed independently. Patient IDs are selected per request and must never be replaced with a sample patient ID.
@@ -132,7 +132,7 @@ An optional seed utility, `backend/seed_patient_roster_redis.py`, can load a sav
 
 ```text
 ESP32 -- WebSocket ws://<backend-host>:8008/ws/live/{doctor_id} --> PC running FastAPI
-PC running FastAPI -- HTTP --> API 1 and API 2 at 200.97.162.162:8000
+PC running FastAPI -- HTTP --> API 1 and API 2 at https://ychat-be.yhealth.me
 PC running FastAPI -- Redis protocol/TLS --> local Redis or configured Redis service
 PC running FastAPI -- Gemini Live connection --> Google Gemini
 ```
@@ -158,10 +158,10 @@ Copy `backend/.env.example` to `backend/.env` and edit the local copy. Do not pl
 | `GEMINI_API_VERSION` | Gemini API version used for Live. | `v1alpha` in code. |
 | `GEMINI_VOICE` | Generated speech voice. | `Kore` |
 | `PORT` | FastAPI/Uvicorn port. | `8008` |
-| `PATIENTS_API_BASE_URL` | API 1 roster base URL. | `http://200.97.162.162:8000/agent/patients` |
+| `PATIENTS_API_BASE_URL` | API 1 roster base URL. | `https://ychat-be.yhealth.me/agent/patients` |
 | `PATIENTS_API_DOCTOR_ID` | Doctor ID appended to API 1 URL. | Set in the local environment. |
 | `DEFAULT_DOCTOR_ID` | Doctor ID for `/ws/live` without a path ID. | Set in the local environment. |
-| `PERSONA_API_BASE_URL` | API 2 persona base URL. | `http://200.97.162.162:8000/persona-hardware` |
+| `PERSONA_API_BASE_URL` | API 2 persona base URL. | `https://ychat-be.yhealth.me/persona-hardware` |
 | `PERSONA_HARDWARE_TOKEN` | API 2 token sent as `x-hardware-token`. | Placeholder; set a current token locally. |
 | `API1_REQUEST_TIMEOUT_S` | API 1 request timeout. | `35` seconds. |
 | `API2_REQUEST_TIMEOUT_S` | API 2 request timeout. | `8` seconds. |
@@ -234,7 +234,7 @@ Typical backend sequence:
 
 ```text
 ✅ Redis cache connected
-HTTP OUT -> GET http://200.97.162.162:8000/agent/patients/{doctor_id}
+HTTP OUT -> GET https://ychat-be.yhealth.me/agent/patients/{doctor_id}
 HTTP OUT <- GET ... status=200 duration_ms=...
 Roster cache pre-warmed: N patients in RAM
 WS IN -> ws://.../ws/live/{doctor_id}
@@ -242,7 +242,7 @@ ESP32 connected ...
 Opening Gemini Live session ...
 Gemini Live session ACTIVE
 Tool 'load_patient_record' ...
-HTTP OUT -> GET http://200.97.162.162:8000/persona-hardware/{patient_id}
+HTTP OUT -> GET https://ychat-be.yhealth.me/persona-hardware/{patient_id}
 API 2 persona loaded and identity-verified ...
 Turn Complete ...
 ```

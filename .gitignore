@@ -38,4 +38,5 @@ Thumbs.db
 node_modules/
 dist/
 .vite/
+compile_commands.json
 

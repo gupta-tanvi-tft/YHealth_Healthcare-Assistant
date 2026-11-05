@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>YHealth Speaker Fleet - Printable Hardware QR Sticker Badges</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f1f5f9;
+      color: #0f172a;
+      padding: 30px;
+    }
+    .sheet-title {
+      text-align: center;
+      margin-bottom: 25px;
+    }
+    .sheet-title h1 {
+      font-size: 24px;
+      font-weight: 800;
+      color: #0f172a;
+    }
+    .sheet-title p {
+      color: #64748b;
+      font-size: 13px;
+      margin-top: 5px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 20px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .sticker-card {
+      background: #ffffff;
+      border: 1.5px dashed #cbd5e1;
+      border-radius: 12px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.04);
+      page-break-inside: avoid;
+    }
+    .card-header {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 6px;
+      margin-bottom: 12px;
+    }
+    .role-badge {
+      font-size: 9.5px;
+      font-weight: 800;
+      color: #ffffff;
+      padding: 3px 8px;
+      border-radius: 4px;
+      letter-spacing: 0.04em;
+    }
+    .device-id {
+      font-size: 16px;
+      font-weight: 900;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: #0f172a;
+    }
+    .qr-container {
+      background: #ffffff;
+      padding: 8px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+    .card-details {
+      width: 100%;
+      text-align: left;
+      font-size: 11.5px;
+      line-height: 1.5;
+    }
+    .person-name {
+      font-size: 14px;
+      font-weight: 700;
+      color: #0f172a;
+      margin-bottom: 4px;
+    }
+    .info-row {
+      color: #475569;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-weight: 600;
+      color: #1e293b;
+    }
+    .card-footer {
+      margin-top: 10px;
+      font-size: 9px;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 700;
+      text-align: center;
+      border-top: 1px solid #f1f5f9;
+      padding-top: 8px;
+      width: 100%;
+    }
+    @media print {
+      body { background: #ffffff; padding: 0; }
+      .sheet-title { display: none; }
+      .sticker-card { box-shadow: none; border: 1px dashed #94a3b8; }
+    }
+  </style>
+</head>
+<body>
+  <div class="sheet-title">
+    <h1>YHealth Smart Healthcare Speaker Fleet (5 Units)</h1>
+    <p>Printable Hardware Pairing & Webcam Provisioning Badges &bull; Cut along dashed borders</p>
+  </div>
+  <div class="grid">
+    
+    <div class="sticker-card">
+      <div class="card-header" style="border-top: 4px solid #10b981;">
+        <span class="role-badge" style="background: #10b981;">DOCTOR CLINICAL UNIT</span>
+        <span class="device-id">SPK-01</span>
+      </div>
+      <div class="qr-container">
+        <img src="SPK-01_QR.png" alt="QR Code for SPK-01" width="220" height="220" />
+      </div>
+      <div class="card-details">
+        <div class="person-name">Dr. Brij Mohan Makkar</div>
+        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:70</span></div>
+        <div class="info-row"><b>Assigned ID:</b> <span class="mono">6789ebb61a093d60fa691c39</span></div>
+        <div class="info-row"><b>Location:</b> Dr. Makkar's Clinic (Consultation Room 1)</div>
+      </div>
+      <div class="card-footer">
+        Scan via Dashboard Webcam for Zero-Touch Pairing
+      </div>
+    </div>
+    
+    <div class="sticker-card">
+      <div class="card-header" style="border-top: 4px solid #10b981;">
+        <span class="role-badge" style="background: #10b981;">DOCTOR CLINICAL UNIT</span>
+        <span class="device-id">SPK-02</span>
+      </div>
+      <div class="qr-container">
+        <img src="SPK-02_QR.png" alt="QR Code for SPK-02" width="220" height="220" />
+      </div>
+      <div class="card-details">
+        <div class="person-name">Dr. Brij Mohan Makkar (Suite 2 / Home)</div>
+        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:71</span></div>
+        <div class="info-row"><b>Assigned ID:</b> <span class="mono">6789ebb61a093d60fa691c39</span></div>
+        <div class="info-row"><b>Location:</b> Consultation Suite 2 / Home Office</div>
+      </div>
+      <div class="card-footer">
+        Scan via Dashboard Webcam for Zero-Touch Pairing
+      </div>
+    </div>
+    
+    <div class="sticker-card">
+      <div class="card-header" style="border-top: 4px solid #0ea5e9;">
+        <span class="role-badge" style="background: #0ea5e9;">PATIENT BEDSIDE STATION</span>
+        <span class="device-id">SPK-03</span>
+      </div>
+      <div class="qr-container">
+        <img src="SPK-03_QR.png" alt="QR Code for SPK-03" width="220" height="220" />
+      </div>
+      <div class="card-details">
+        <div class="person-name">Vijay Gupta Sir</div>
+        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:72</span></div>
+        <div class="info-row"><b>Assigned ID:</b> <span class="mono">PAT-VIJAY-01</span></div>
+        <div class="info-row"><b>Location:</b> Home Bedside Station (Primary)</div>
+      </div>
+      <div class="card-footer">
+        Scan via Dashboard Webcam for Zero-Touch Pairing
+      </div>
+    </div>
+    
+    <div class="sticker-card">
+      <div class="card-header" style="border-top: 4px solid #0ea5e9;">
+        <span class="role-badge" style="background: #0ea5e9;">PATIENT BEDSIDE STATION</span>
+        <span class="device-id">SPK-04</span>
+      </div>
+      <div class="qr-container">
+        <img src="SPK-04_QR.png" alt="QR Code for SPK-04" width="220" height="220" />
+      </div>
+      <div class="card-details">
+        <div class="person-name">Internal Lab Testing Unit</div>
+        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:73</span></div>
+        <div class="info-row"><b>Assigned ID:</b> <span class="mono">PAT-TEST-01</span></div>
+        <div class="info-row"><b>Location:</b> Hardware Lab Testbench 1</div>
+      </div>
+      <div class="card-footer">
+        Scan via Dashboard Webcam for Zero-Touch Pairing
+      </div>
+    </div>
+    
+    <div class="sticker-card">
+      <div class="card-header" style="border-top: 4px solid #0ea5e9;">
+        <span class="role-badge" style="background: #0ea5e9;">PATIENT BEDSIDE STATION</span>
+        <span class="device-id">SPK-05</span>
+      </div>
+      <div class="qr-container">
+        <img src="SPK-05_QR.png" alt="QR Code for SPK-05" width="220" height="220" />
+      </div>
+      <div class="card-details">
+        <div class="person-name">Company Field & Partner Testing</div>
+        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:74</span></div>
+        <div class="info-row"><b>Assigned ID:</b> <span class="mono">PAT-DEMO-01</span></div>
+        <div class="info-row"><b>Location:</b> Executive Demo Lounge</div>
+      </div>
+      <div class="card-footer">
+        Scan via Dashboard Webcam for Zero-Touch Pairing
+      </div>
+    </div>
+    
+  </div>
+</body>
+</html>

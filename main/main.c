@@ -1,19 +1,20 @@
 #include "bsp_board.h"
 #include "driver/gpio.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
-#include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "rgb_led_driver.h"
-#include "wifi_connect.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "rgb_led_driver.h"
+#include "wakeword_engine.h"
+#include "wifi_connect.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -44,15 +45,18 @@ static const char *TAG = "GEMINI_ASSISTANT";
 #define WAKE_CONFIRM_CHUNKS                                                    \
   2 // need 2 loud chunks (~64 ms) so clicks don't wake us
 #define MIN_SPEECH_DURATION_MS 200 // ignore blips shorter than this
-#define SILENCE_TIMEOUT_MS 1000    // trailing silence => utterance finished
-#define IDLE_STANDBY_TIMEOUT_S 30  // inactivity => Standby
-#define GEMINI_RESPONSE_TIMEOUT_MS 12000
+#define SILENCE_TIMEOUT_MS                                                     \
+  650 // trailing silence => utterance finished (saves audio tokens & low
+      // latency)
+#define IDLE_STANDBY_TIMEOUT_S 30 // inactivity => Standby
+#define INACTIVITY_SLEEP_TIMEOUT_S                                             \
+  120 // 2 minutes (120 s) => Disconnect & Sleep
+#define GEMINI_RESPONSE_TIMEOUT_MS 4000
 #define MIC_HOLDOFF_AFTER_PLAYBACK_MS                                          \
   400 // keep mic muted after speaker stops (room echo tail)
 #define BARGE_IN_THRESHOLD_RMS                                                 \
   200.0f // deliberate speech while the speaker is active
-#define BARGE_IN_CONFIRM_CHUNKS                                                \
-  5 // 160 ms confirms barge-in speech
+#define BARGE_IN_CONFIRM_CHUNKS 5 // 160 ms confirms barge-in speech
 
 // Playback
 #define PLAYBACK_RB_SIZE 65536 // 2.0 s of 16 kHz mono s16
@@ -66,13 +70,15 @@ static const char *TAG = "GEMINI_ASSISTANT";
 // STATE
 // ==========================================================
 typedef enum {
-  CONV_STATE_STANDBY = 0, // breathing blue, waiting for voice
-  CONV_STATE_LISTENING,   // streaming mic to Gemini
-  CONV_STATE_THINKING,    // utterance ended, waiting for reply
-  CONV_STATE_SPEAKING     // playing Gemini audio
+  CONV_STATE_SLEEP = 0, // WebSocket disconnected, breathing RED light
+  CONV_STATE_STANDBY,   // breathing blue, waiting for voice
+  CONV_STATE_LISTENING, // streaming mic to Gemini (green)
+  CONV_STATE_THINKING,  // utterance ended, waiting for reply (amber)
+  CONV_STATE_SPEAKING   // playing Gemini audio (purple)
 } conv_state_t;
 
 static volatile conv_state_t s_conv_state = CONV_STATE_STANDBY;
+static volatile bool s_ws_sleep = false;
 static volatile int64_t s_last_speech_time_ms = 0;
 static volatile int64_t s_playback_ended_time_ms = 0;
 static volatile int64_t s_last_audio_rx_ms = 0;
@@ -123,7 +129,6 @@ static inline size_t buffered_get(void) {
   return __atomic_load_n(&s_buffered_bytes, __ATOMIC_SEQ_CST);
 }
 
-
 static float compute_pcm_rms(const int16_t *pcm_samples, int num_samples) {
   if (num_samples <= 0)
     return 0.0f;
@@ -169,6 +174,7 @@ static void flush_playback_ringbuffer(void) {
 // maybe_send_pending_interrupt moved below
 
 static bool pending_interrupt = false;
+static volatile bool s_is_interrupting = false;
 static char pending_reason[32] = {0};
 static void maybe_send_pending_interrupt(void);
 // KWS (keyword spotting) disabled – removed unused variables
@@ -186,6 +192,7 @@ static void request_interruption(const char *reason) {
   s_last_interrupt_time_ms = now;
   ESP_LOGI(TAG, "⏹️ Interrupt requested (%s)", reason);
   // Stop any ongoing playback and reset state
+  s_is_interrupting = true;
   flush_playback_ringbuffer();
   s_playback_ctx.is_playing = false;
   s_conv_state = CONV_STATE_LISTENING;
@@ -198,7 +205,6 @@ static void request_interruption(const char *reason) {
   maybe_send_pending_interrupt();
 }
 
-
 // ==========================================================
 // LED ANIMATION (3 centre LEDs: 2, 3, 4) — runs on Core 0 @ 20 fps
 // ==========================================================
@@ -207,6 +213,9 @@ static inline void set_center(uint8_t r, uint8_t g, uint8_t b) {
   rgb_led_set_pixel(3, r, g, b);
   rgb_led_set_pixel(4, r, g, b);
 }
+
+static void enter_sleep_mode(const char *reason);
+static void exit_sleep_mode(const char *reason);
 
 static void led_animation_task(void *pvParameters) {
   uint32_t step = 0;
@@ -218,40 +227,59 @@ static void led_animation_task(void *pvParameters) {
     uint64_t t = now_ms();
     if (t < s_vol_overlay_until_ms) {
       rgb_led_set_vu_meter(s_vol_overlay_level);
-    } else if (!s_ws_connected) {
-      // Keep the relay outage visible after boot; the startup color alone was
-      // immediately replaced by the normal standby animation.
+    } else if (s_ws_sleep || s_conv_state == CONV_STATE_SLEEP) {
+      // Manual: Bright Parrot Green (Solid/Blinking) - In sleep mode / waiting
+      // for wake word
       rgb_led_clear();
-      set_center(255, 100, 0);
+      float b = 0.35f + 0.65f * (1.0f + sinf(step * 0.08f)) / 2.0f;
+      set_center((uint8_t)(50 * b), (uint8_t)(240 * b), (uint8_t)(20 * b));
+      rgb_led_refresh();
+    } else if (!s_ws_connected) {
+      // Manual: Bright Parrot Green (Solid/Blinking) - Disconnected / waiting
+      // for reconnect
+      rgb_led_clear();
+      float b = 0.3f + 0.7f * (1.0f + sinf(step * 0.2f)) / 2.0f;
+      set_center((uint8_t)(55 * b), (uint8_t)(245 * b), (uint8_t)(25 * b));
       rgb_led_refresh();
     } else {
       rgb_led_clear();
       switch (s_conv_state) {
+      case CONV_STATE_SLEEP: {
+        // Bright Parrot Green (slow calm breathing)
+        float b = 0.35f + 0.65f * (1.0f + sinf(step * 0.08f)) / 2.0f;
+        set_center((uint8_t)(50 * b), (uint8_t)(240 * b), (uint8_t)(20 * b));
+        break;
+      }
       case CONV_STATE_STANDBY: {
+        // Bright Parrot Green (calm standby waiting for wake word)
         float b = 0.4f + 0.6f * (1.0f + sinf(step * 0.1f)) / 2.0f;
-        set_center((uint8_t)(60 * b), (uint8_t)(140 * b), (uint8_t)(200 * b));
+        set_center((uint8_t)(50 * b), (uint8_t)(240 * b), (uint8_t)(20 * b));
         break;
       }
       case CONV_STATE_LISTENING: {
+        // Manual: Pastel / Soft Pink (Pulsing) - Speak now, assistant capturing
+        // voice
         float b = 0.5f + 0.5f * (1.0f + sinf(step * 0.25f)) / 2.0f;
-        set_center((uint8_t)(90 * b), (uint8_t)(210 * b), (uint8_t)(140 * b));
+        set_center((uint8_t)(245 * b), (uint8_t)(115 * b), (uint8_t)(165 * b));
         break;
       }
       case CONV_STATE_THINKING: {
+        // Manual: Pastel Green (Pulsing) - Assistant processing query
         float b = 0.4f + 0.6f * (1.0f + sinf(step * 0.3f)) / 2.0f;
-        set_center((uint8_t)(230 * b), (uint8_t)(150 * b), (uint8_t)(100 * b));
+        set_center((uint8_t)(90 * b), (uint8_t)(225 * b), (uint8_t)(130 * b));
         break;
       }
       case CONV_STATE_SPEAKING: {
+        // Manual: Teal Blue (Pulsing / Wave) - Assistant answering over speaker
         float w2 = (1.0f + sinf(step * 0.35f)) / 2.0f;
         float w3 = (1.0f + sinf(step * 0.35f + 1.0f)) / 2.0f;
         float w4 = (1.0f + sinf(step * 0.35f + 2.0f)) / 2.0f;
-        rgb_led_set_pixel(2, (uint8_t)(170 * w2), (uint8_t)(120 * w2),
-                          (uint8_t)(220 * w2));
-        rgb_led_set_pixel(3, (uint8_t)(170 * w3), (uint8_t)(120 * w3),
-                          (uint8_t)(220 * w3));
-        rgb_led_set_pixel(4, (uint8_t)(170 * w4), (uint8_t)(120 * w4),
-                          (uint8_t)(220 * w4));
+        rgb_led_set_pixel(2, (uint8_t)(15 * w2), (uint8_t)(210 * w2),
+                          (uint8_t)(230 * w2));
+        rgb_led_set_pixel(3, (uint8_t)(15 * w3), (uint8_t)(210 * w3),
+                          (uint8_t)(230 * w3));
+        rgb_led_set_pixel(4, (uint8_t)(15 * w4), (uint8_t)(210 * w4),
+                          (uint8_t)(230 * w4));
         break;
       }
       }
@@ -279,18 +307,22 @@ static void finish_playback(void) {
   bool end_conversation = s_end_conversation_after_playback;
   s_end_conversation_after_playback = false;
   if (s_conv_state == CONV_STATE_SPEAKING) {
-    s_conv_state = status_only ? CONV_STATE_THINKING
-                               : (end_conversation ? CONV_STATE_STANDBY
-                                                   : CONV_STATE_LISTENING);
-    s_last_speech_time_ms = now_ms();
-    update_led_state(s_conv_state);
-    if (status_only)
-      ESP_LOGI(TAG, "ℹ️ Status update finished. Still waiting for the result.");
-    else if (end_conversation)
-      ESP_LOGI(TAG, "🗣️ Sign-off finished. Conversation returned to standby.");
-    else
-      ESP_LOGI(TAG,
-               "🗣️ Assistant finished speaking. Ready for the next question.");
+    if (end_conversation) {
+      enter_sleep_mode("doctor goodbye sign-off");
+      ESP_LOGI(TAG, "🗣️ Doctor goodbye finished. Disconnected WebSocket and "
+                    "entered SLEEP mode (RED light).");
+    } else {
+      s_conv_state = status_only ? CONV_STATE_THINKING : CONV_STATE_LISTENING;
+      s_last_speech_time_ms = now_ms();
+      update_led_state(s_conv_state);
+      if (status_only)
+        ESP_LOGI(TAG,
+                 "ℹ️ Status update finished. Still waiting for the result.");
+      else
+        ESP_LOGI(
+            TAG,
+            "🗣️ Assistant finished speaking. Ready for the next question.");
+    }
   }
 }
 
@@ -432,16 +464,17 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
           bool end_conversation = s_end_conversation_after_playback &&
                                   buffered_get() == 0 &&
                                   !s_playback_ctx.is_playing;
-          if (end_conversation)
+          if (end_conversation) {
             s_end_conversation_after_playback = false;
-          s_conv_state =
-              end_conversation ? CONV_STATE_STANDBY : CONV_STATE_LISTENING;
-          s_last_speech_time_ms = now_ms();
-          update_led_state(s_conv_state);
-          if (end_conversation)
-            ESP_LOGI(TAG, "⚡ Sign-off complete. Returned to standby.");
-          else
+            enter_sleep_mode("doctor goodbye (no audio)");
+            ESP_LOGI(TAG, "⚡ Sign-off complete. Disconnected WebSocket and "
+                          "entered SLEEP mode.");
+          } else {
+            s_conv_state = CONV_STATE_LISTENING;
+            s_last_speech_time_ms = now_ms();
+            update_led_state(s_conv_state);
             ESP_LOGI(TAG, "⚡ Turn complete (no audio). Listening again.");
+          }
         }
       }
     } else if ((data->op_code == 0x02 || data->op_code == 0x00) &&
@@ -486,32 +519,32 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
       xSemaphoreGive(s_ws_connect_mutex);
       return ESP_OK;
     }
-    // The client auto-reconnects; give it a moment before tearing it down.
-    for (int i = 0; i < 30 && !s_ws_connected; i++)
-      vTaskDelay(pdMS_TO_TICKS(50));
-    if (s_ws_connected &&
-        esp_websocket_client_is_connected(s_persistent_ws_client)) {
-      xSemaphoreGive(s_ws_connect_mutex);
-      return ESP_OK;
-    }
 
-    ESP_LOGW(TAG, "Recreating stale WebSocket client...");
+    ESP_LOGI(TAG, "Cleaning up inactive WebSocket client for immediate reconnect...");
     esp_websocket_client_stop(s_persistent_ws_client);
     esp_websocket_client_destroy(s_persistent_ws_client);
     s_persistent_ws_client = NULL;
     s_ws_connected = false;
   }
 
-  char ws_url[240];
+  wifi_ap_record_t ap_info = {0};
+  int rssi = -50;
+  char ssid[33] = "TFTus-WiFi";
+  if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+    rssi = ap_info.rssi;
+    strncpy(ssid, (char *)ap_info.ssid, sizeof(ssid) - 1);
+  }
+
+  char ws_url[256];
   if (strcmp(SERVER_PORT, "443") == 0) {
-    snprintf(ws_url, sizeof(ws_url), "wss://%s/ws/live/%s?device_id=%s",
-             SERVER_IP, DOCTOR_ID, s_device_id);
+    snprintf(ws_url, sizeof(ws_url), "wss://%s/ws/live/%s?device_id=%s&rssi=%d&ssid=%s",
+             SERVER_IP, DOCTOR_ID, s_device_id, rssi, ssid);
   } else if (strlen(SERVER_PORT) == 0 || strcmp(SERVER_PORT, "80") == 0) {
-    snprintf(ws_url, sizeof(ws_url), "ws://%s/ws/live/%s?device_id=%s",
-             SERVER_IP, DOCTOR_ID, s_device_id);
+    snprintf(ws_url, sizeof(ws_url), "ws://%s/ws/live/%s?device_id=%s&rssi=%d&ssid=%s",
+             SERVER_IP, DOCTOR_ID, s_device_id, rssi, ssid);
   } else {
-    snprintf(ws_url, sizeof(ws_url), "ws://%s:%s/ws/live/%s?device_id=%s",
-             SERVER_IP, SERVER_PORT, DOCTOR_ID, s_device_id);
+    snprintf(ws_url, sizeof(ws_url), "ws://%s:%s/ws/live/%s?device_id=%s&rssi=%d&ssid=%s",
+             SERVER_IP, SERVER_PORT, DOCTOR_ID, s_device_id, rssi, ssid);
   }
 
   ESP_LOGI(TAG, "Connecting WebSocket: %s", ws_url);
@@ -521,8 +554,8 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
       .buffer_size = 32768,
       .reconnect_timeout_ms = 1500,
       .network_timeout_ms = 8000,
-      .ping_interval_sec = 5,
-      .pingpong_timeout_sec = 10,
+      .ping_interval_sec = 10,
+      .pingpong_timeout_sec = 25,
       .crt_bundle_attach = esp_crt_bundle_attach,
       .skip_cert_common_name_check = true,
       .headers = "ngrok-skip-browser-warning: 1\r\nUser-Agent: ESP32\r\n",
@@ -546,8 +579,8 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
     xSemaphoreGive(s_ws_connect_mutex);
     return err;
   }
-  for (int i = 0; !s_ws_connected && i < 50; i++)
-    vTaskDelay(pdMS_TO_TICKS(50));
+  for (int i = 0; !s_ws_connected && i < 100; i++)
+    vTaskDelay(pdMS_TO_TICKS(15));
   esp_err_t result = (s_ws_connected && s_persistent_ws_client &&
                       esp_websocket_client_is_connected(s_persistent_ws_client))
                          ? ESP_OK
@@ -562,7 +595,8 @@ static inline bool ws_ready(void) {
 }
 
 static void maybe_send_pending_interrupt(void) {
-  if (!pending_interrupt) return;
+  if (!pending_interrupt)
+    return;
   const char *interrupt = "{\"event\":\"interrupt\"}";
   int len = strlen(interrupt);
   // Try a few times, aborting if the WebSocket is not ready.
@@ -572,19 +606,48 @@ static void maybe_send_pending_interrupt(void) {
       return; // keep pending_interrupt true so it will be retried later
     }
     int res = esp_websocket_client_send_text(s_persistent_ws_client, interrupt,
-                                            len, pdMS_TO_TICKS(250));
+                                             len, pdMS_TO_TICKS(250));
     if (res >= 0) {
-      ESP_LOGI(TAG, "📤 Pending interrupt sent successfully (%s)", pending_reason);
+      ESP_LOGI(TAG, "📤 Pending interrupt sent successfully (%s)",
+               pending_reason);
       pending_interrupt = false;
       return;
     }
-    ESP_LOGW(TAG, "⏹️ Pending interrupt send failed (attempt %d err=%d), retrying", attempt + 1, res);
+    ESP_LOGW(TAG,
+             "⏹️ Pending interrupt send failed (attempt %d err=%d), retrying",
+             attempt + 1, res);
     vTaskDelay(pdMS_TO_TICKS(100)); // short back‑off before next attempt
   }
   ESP_LOGW(TAG, "⏹️ Giving up after retries – will retry on next reconnect");
 }
 
+static void enter_sleep_mode(const char *reason) {
+  ESP_LOGI(TAG,
+           "🛑 Entering SLEEP mode (%s): disconnecting WebSocket, RED light.",
+           reason);
+  s_ws_sleep = true;
+  s_conv_state = CONV_STATE_SLEEP;
+  wakeword_reset();
+  if (s_persistent_ws_client) {
+    esp_websocket_client_stop(s_persistent_ws_client);
+    esp_websocket_client_destroy(s_persistent_ws_client);
+    s_persistent_ws_client = NULL;
+  }
+  s_ws_connected = false;
+  flush_playback_ringbuffer();
+}
 
+static void exit_sleep_mode(const char *reason) {
+  ESP_LOGI(TAG,
+           "🟢 Exiting SLEEP mode (%s): reconnecting WebSocket, switching to "
+           "LISTENING.",
+           reason);
+  s_ws_sleep = false;
+  s_last_speech_time_ms = now_ms();
+  s_conv_state = CONV_STATE_LISTENING;
+  update_led_state(CONV_STATE_LISTENING);
+  ensure_websocket_connected(&s_playback_ctx);
+}
 
 // Keep network recovery off the real-time microphone task. A reconnect can
 // take seconds; doing it inline would stop mic capture and lose the rest of
@@ -592,6 +655,10 @@ static void maybe_send_pending_interrupt(void) {
 static void websocket_maintenance_task(void *pvParameters) {
   int64_t last_warning_ms = 0;
   while (1) {
+    if (s_ws_sleep) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
     if (ws_ready()) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
@@ -630,7 +697,6 @@ static void continuous_mic_stream_task(void *pvParameters) {
       0};             // last 2 chunks (64 ms) so the first consonant isn't lost
   int pre_chunks = 0; // how many of those are valid (0..2)
   int wake_hits = 0;
-  int barge_hits = 0;
 
   int speech_accum_ms = 0;
   int silence_accum_ms = 0;
@@ -661,14 +727,16 @@ static void continuous_mic_stream_task(void *pvParameters) {
 
     int64_t t = now_ms();
 
-    // 1. While speaking, ignore ALL mic input so Lira finishes her sentence.
-    //    Barge-in is disabled — the doctor must wait for the response to end.
+    // 0. While speaking, completely ignore microphone audio (voice barge-in disabled).
+    // The hardware lacks an AEC reference loop; without AEC, speaker output bleeds
+    // directly into the adjacent ES7210 microphones, causing false barge-in triggers
+    // and random audio pauses mid-sentence.
+    // To interrupt playback, the user can press the physical BOOT button (GPIO 0).
     if (s_conv_state == CONV_STATE_SPEAKING) {
       speech_accum_ms = silence_accum_ms = 0;
       pre_chunks = wake_hits = 0;
       continue;
     }
-    barge_hits = 0;
     // Briefly mute the echo tail after the speaker stops.
     if ((t - s_playback_ended_time_ms) < MIC_HOLDOFF_AFTER_PLAYBACK_MS) {
       speech_accum_ms = silence_accum_ms = 0;
@@ -676,11 +744,47 @@ static void continuous_mic_stream_task(void *pvParameters) {
       continue;
     }
 
-    // 2. STANDBY: wait for confirmed voice activity
+    // 1. SLEEP MODE: WebSocket is disconnected, red light is on.
+    // Listen for local wakeword ("hello assistant" or "LIRA") or confirmed voice activation
+    if (s_conv_state == CONV_STATE_SLEEP || s_ws_sleep) {
+      wakeword_result_t ww_res;
+      bool ww_hit = wakeword_feed_samples(chunk_mono, chunk_samples, &ww_res);
+      if (ww_hit || (rms >= VAD_WAKE_THRESHOLD_RMS && ++wake_hits >= WAKE_CONFIRM_CHUNKS)) {
+        const char *trigger_name = ww_hit ? ww_res.keyword : "Wake Word (Voice)";
+        ESP_LOGI(TAG, "🎯 Wakeword detected in SLEEP: '%s'! Waking up instantly...",
+                 trigger_name);
+        exit_sleep_mode(trigger_name);
+        if (ws_ready()) {
+          esp_websocket_client_send_bin(s_persistent_ws_client,
+                                        (const char *)chunk_mono,
+                                        CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
+        }
+        speech_accum_ms = chunk_duration_ms * 2;
+        silence_accum_ms = 0;
+        pre_chunks = wake_hits = 0;
+      }
+      continue;
+    }
+
+    // 2. STANDBY: wait for confirmed voice activity or wakeword
     if (s_conv_state == CONV_STATE_STANDBY) {
-      if (rms >= VAD_WAKE_THRESHOLD_RMS && ++wake_hits >= WAKE_CONFIRM_CHUNKS) {
-        ESP_LOGI(TAG, "🗣️ Voice detected (RMS %.1f). Activating session...",
-                 rms);
+      // 2-minute inactivity timeout: if no conversation for 2 minutes,
+      // disconnect and sleep
+      if ((t - s_last_speech_time_ms) > (INACTIVITY_SLEEP_TIMEOUT_S * 1000)) {
+        ESP_LOGI(TAG,
+                 "⏳ No conversation for %d seconds. Disconnecting WebSocket "
+                 "and entering SLEEP (RED light)...",
+                 INACTIVITY_SLEEP_TIMEOUT_S);
+        enter_sleep_mode("2 minutes inactivity");
+        continue;
+      }
+
+      wakeword_result_t ww_res;
+      bool ww_hit = wakeword_feed_samples(chunk_mono, chunk_samples, &ww_res);
+      if (ww_hit || (rms >= VAD_WAKE_THRESHOLD_RMS &&
+                     ++wake_hits >= WAKE_CONFIRM_CHUNKS)) {
+        ESP_LOGI(TAG, "🗣️ Session activated (%s, RMS %.1f)",
+                 ww_hit ? ww_res.keyword : "Voice Activity", rms);
         if (!ws_ready()) {
           // Reconnect runs in websocket_maintenance_task; never block the
           // real-time mic task while it repairs the connection.
@@ -694,6 +798,7 @@ static void continuous_mic_stream_task(void *pvParameters) {
 
         s_conv_state = CONV_STATE_LISTENING;
         s_last_speech_time_ms = t;
+        update_led_state(CONV_STATE_LISTENING);
         if (pre_chunks > 0) {
           int off = (2 - pre_chunks) * chunk_samples;
           esp_websocket_client_send_bin(
@@ -769,11 +874,29 @@ static void continuous_mic_stream_task(void *pvParameters) {
       continue;
     }
 
-    // 4. THINKING: wait for audio / turn_complete, recover after a long timeout
+    // 4. THINKING: wait for audio / turn_complete, but keep listening if doctor
+    // speaks!
     if (s_conv_state == CONV_STATE_THINKING) {
+      if (rms >= VAD_ACTIVE_THRESHOLD_RMS) {
+        ESP_LOGI(TAG,
+                 "🗣️ Doctor speaking (RMS %.1f) during thinking. Resuming "
+                 "active listening.",
+                 rms);
+        s_conv_state = CONV_STATE_LISTENING;
+        s_last_speech_time_ms = t;
+        speech_accum_ms = chunk_duration_ms;
+        silence_accum_ms = 0;
+        update_led_state(CONV_STATE_LISTENING);
+        if (ws_ready() && esp_websocket_client_send_bin(
+                              s_persistent_ws_client, (const char *)chunk_mono,
+                              CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0)
+          ESP_LOGW(TAG, "Failed to stream PCM frame!");
+        continue;
+      }
       speech_accum_ms = silence_accum_ms = 0;
       if ((t - s_last_speech_time_ms) > GEMINI_RESPONSE_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "⚠️ No Gemini response after %d ms. Listening again.",
+        ESP_LOGW(TAG,
+                 "⚠️ Thinking timeout after %d ms. Resuming active listening.",
                  GEMINI_RESPONSE_TIMEOUT_MS);
         s_conv_state = CONV_STATE_LISTENING;
         s_last_speech_time_ms = t;
@@ -791,6 +914,11 @@ static void continuous_mic_stream_task(void *pvParameters) {
 #define GPIO_BTN_BOOT GPIO_NUM_0
 
 static void toggle_conversation(const char *who) {
+  if (s_conv_state == CONV_STATE_SLEEP || s_ws_sleep) {
+    ESP_LOGI(TAG, "🔘 %s -> Waking up from SLEEP mode", who);
+    exit_sleep_mode(who);
+    return;
+  }
   if (s_conv_state == CONV_STATE_STANDBY) {
     ESP_LOGI(TAG, "🔘 %s -> Conversation ACTIVATED", who);
     if (!ws_ready()) {
@@ -803,11 +931,9 @@ static void toggle_conversation(const char *who) {
     s_conv_state = CONV_STATE_LISTENING;
     update_led_state(CONV_STATE_LISTENING);
   } else {
-    ESP_LOGI(TAG, "🔘 %s -> Conversation STOPPED (Standby)", who);
+    ESP_LOGI(TAG, "🔘 %s -> Entering SLEEP mode (Standby)", who);
     request_interruption("manual stop");
-    s_conv_state = CONV_STATE_STANDBY;
-    flush_playback_ringbuffer();
-    update_led_state(CONV_STATE_STANDBY);
+    enter_sleep_mode("manual button stop");
   }
 }
 
@@ -910,9 +1036,11 @@ void app_main(void) {
   ESP_LOGI(TAG, "   • BOOT / Button 3: manual start-stop, Buttons 1&2: volume");
 
   ESP_ERROR_CHECK(esp_board_init(SAMPLE_RATE, 1, 16));
+  wakeword_init();
 
   esp_err_t nvs_ret = nvs_flash_init();
-  if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+  if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     nvs_ret = nvs_flash_init();
   }
@@ -950,8 +1078,8 @@ void app_main(void) {
                           10, NULL, 1);
   xTaskCreatePinnedToCore(gpio_button_task, "gpio_button_task", 6144, NULL, 4,
                           NULL, 0);
-  xTaskCreatePinnedToCore(usb_serial_listener_task, "usb_serial_task", 3072, NULL, 2,
-                          NULL, 0);
+  xTaskCreatePinnedToCore(usb_serial_listener_task, "usb_serial_task", 3072,
+                          NULL, 2, NULL, 0);
 
   ESP_LOGI(TAG, "Connecting to Wi-Fi...");
   if (wifi_init_sta() != ESP_OK) {

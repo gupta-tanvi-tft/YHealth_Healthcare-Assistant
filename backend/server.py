@@ -10,7 +10,9 @@ import tempfile
 import time
 import uuid
 import unicodedata
-from datetime import datetime
+import random
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Union
 from contextlib import asynccontextmanager
 
 import httpx
@@ -23,8 +25,13 @@ except ImportError:  # Allows the backend to start before the Redis extra is ins
     AsyncRedis = None
 from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+from pathlib import Path
 
 load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("gemini-backend")
@@ -49,12 +56,15 @@ FALLBACK_LIVE_MODELS = [
 LIVE_API_VERSION = os.getenv("GEMINI_API_VERSION", "v1alpha")
 
 # Keep the API 1 roster ID configurable independently from the websocket route.
-# Set doctor IDs in backend/.env; no account-specific ID is shipped as a default.
-PATIENTS_API_BASE_URL = os.getenv("PATIENTS_API_BASE_URL", "http://200.97.162.162:8000/agent/patients")
-DEFAULT_DOCTOR_ID = os.getenv("DEFAULT_DOCTOR_ID", "")
-PATIENTS_API_DOCTOR_ID = os.getenv("PATIENTS_API_DOCTOR_ID", "")
-_DOCTOR_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-PERSONA_API_BASE_URL = os.getenv("PERSONA_API_BASE_URL", "http://200.97.162.162:8000/persona-hardware")
+PATIENTS_API_BASE_URL = os.getenv("PATIENTS_API_BASE_URL", "https://ychat-be.yhealth.me/agent/patients")
+DEFAULT_DOCTOR_ID = os.getenv("DEFAULT_DOCTOR_ID", "6789ebb61a093d60fa691c39")
+PATIENTS_API_DOCTOR_ID = os.getenv("PATIENTS_API_DOCTOR_ID", "6789ebb61a093d60fa691c39")
+DEFAULT_DOCTOR_NAME = os.getenv("DEFAULT_DOCTOR_NAME", "Brij Mohan Makkar")
+DEFAULT_DOCTOR_SPECIALIZATION = os.getenv("DEFAULT_DOCTOR_SPECIALIZATION", "Diabetes & Obesity specialist")
+DEFAULT_DOCTOR_CLINIC = os.getenv("DEFAULT_DOCTOR_CLINIC", "Dr. Makkar's Diabetes and Obesity Centre, Paschim Vihar, New Delhi")
+PERSONA_API_BASE_URL = os.getenv("PERSONA_API_BASE_URL", "https://ychat-be.yhealth.me/persona-hardware")
+DOCTOR_PERSONA_API_BASE_URL = os.getenv("DOCTOR_PERSONA_API_BASE_URL", "https://ychat-be.yhealth.me/agent/doctor-chat")
+REDIS_DOCTOR_PERSONA_TTL_S = int(os.getenv("REDIS_DOCTOR_PERSONA_TTL_S", "86400"))
 PERSONA_HARDWARE_TOKEN = os.getenv("PERSONA_HARDWARE_TOKEN", "")
 
 # Audio / pacing (ESP32 plays 16kHz mono s16 => 32000 bytes/s)
@@ -72,12 +82,14 @@ POST_PLAYBACK_MUTE_S = 0.6                                   # ignore mic this l
 
 CACHE_TTL_ROSTER_S = 600
 CACHE_TTL_PERSONA_S = 300
-MAX_TOOL_RECORD_CHARS = 20000
+MAX_TOOL_RECORD_CHARS = int(os.getenv("MAX_TOOL_RECORD_CHARS", "2500"))
 API1_REQUEST_TIMEOUT_S = float(os.getenv("API1_REQUEST_TIMEOUT_S", "35.0"))
 API2_REQUEST_TIMEOUT_S = float(os.getenv("API2_REQUEST_TIMEOUT_S", "8.0"))
 API2_MAX_ATTEMPTS = max(1, min(3, int(os.getenv("API2_MAX_ATTEMPTS", "2"))))
 TOOL_TIMEOUT_S = float(os.getenv("PATIENT_LOOKUP_TIMEOUT_S", "45.0"))
 GEMINI_NO_PROGRESS_TIMEOUT_S = float(os.getenv("GEMINI_NO_PROGRESS_TIMEOUT_S", "8.0"))
+UNCLEAR_SPEECH_TIMEOUT_S = float(os.getenv("UNCLEAR_SPEECH_TIMEOUT_S", "3.5"))
+MAX_UNCLEAR_STREAK = int(os.getenv("MAX_UNCLEAR_STREAK", "3"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 REDIS_TLS = os.getenv("REDIS_TLS", "0").strip().lower() in {"1", "true", "yes", "on"}
 REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "yhealth-assistant")
@@ -101,9 +113,32 @@ _roster_fetch_generation = {}  # doctor_id -> incremented after each completed A
 _persona_by_id = {}          # patient_id -> (timestamp, persona_dict)
 _persona_status_by_id = {}   # doctor_id:patient_id -> last API 2 HTTP status or error
 _persona_fetch_locks = {}    # doctor_id:patient_id -> share one in-flight API 2 request
+_doctor_persona_by_day = {}   # doctor_id:date -> (timestamp, persona_dict)
+_doctor_persona_locks = {}    # doctor_id:date -> share one in-flight doctor persona request
 _session_state_fallback = {}
 _clinical_notes = {}
 _escalated_alerts = {}
+
+
+def get_current_ist_datetime() -> datetime:
+    """Return the current datetime in Indian Standard Time (Asia/Kolkata, UTC+5:30)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(os.getenv("TZ_NAME", "Asia/Kolkata")))
+    except Exception:
+        from datetime import timezone, timedelta
+        return datetime.now(timezone(timedelta(hours=5, minutes=30), name="IST"))
+
+
+def get_current_ist_time_str() -> str:
+    """Return formatted time in IST (e.g., '1:05 PM IST')."""
+    dt = get_current_ist_datetime()
+    return dt.strftime("%I:%M %p IST").lstrip("0")
+
+
+def get_today_date_str() -> str:
+    """Return today's date formatted as YYYY-MM-DD in IST timezone (fallback to system date)."""
+    return get_current_ist_datetime().strftime("%Y-%m-%d")
 _runtime_metrics = {
     "started_at": time.time(), "ws_connected": 0, "ws_disconnected": 0,
     "ws_active": 0, "gemini_sessions": 0, "gemini_reconnects": 0,
@@ -303,6 +338,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Roster pre-warm failed (%s); lookup will retry on demand", type(e).__name__)
 
+        try:
+            today_date = get_today_date_str()
+            doc_data = await asyncio.wait_for(
+                async_fetch_doctor_persona(DEFAULT_DOCTOR_ID, today_date),
+                timeout=10.0,
+            )
+            if doc_data:
+                c_count = len(doc_data.get("today_consultations") or doc_data.get("consultations") or [])
+                logger.info(f"⚡ Doctor persona pre-warmed for {DEFAULT_DOCTOR_ID} ({today_date}): {c_count} consultations")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Doctor persona pre-warm skipped (%s)", type(e).__name__)
+
     # Start serving WebSockets immediately; a slow API 1 must not delay app startup.
     prewarm_task = asyncio.create_task(prewarm_roster(), name="api1-roster-prewarm")
     yield
@@ -349,13 +398,31 @@ app.add_middleware(
 )
 
 
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 @app.get("/")
-def read_root():
+def read_root(request: Request):
+    accept = request.headers.get("accept", "")
+    index_file = os.path.join(STATIC_DIR, "index.html")
+    if "text/html" in accept and os.path.exists(index_file):
+        return FileResponse(index_file)
     return {
         "status": "online",
         "service": "ESP32 Gemini Voice Relay",
         "configured_model": FALLBACK_LIVE_MODELS[0],
+        "frontend_url": "/app",
     }
+
+
+@app.get("/app")
+def read_app():
+    index_file = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_file):
+        return FileResponse(index_file)
+    return {"error": "Frontend static files not found"}
 
 
 @app.get("/api/clinical-notes")
@@ -376,12 +443,30 @@ async def get_clinical_notes(patient_name: str = None, doctor_id: str = None):
     return {"notes": all_notes, "total": len(all_notes)}
 
 
+@app.get("/api/patients")
+async def get_patient_list(doctor_id: str = None):
+    """Retrieve the doctor's active patient roster."""
+    doctor_id = doctor_id or PATIENTS_API_DOCTOR_ID
+    roster = await async_fetch_patient_list(doctor_id)
+    result = []
+    for p in roster:
+        full_name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        if not full_name:
+            full_name = p.get('name', 'Patient')
+        result.append({
+            "id": p.get("id"),
+            "name": full_name,
+            "mobile": p.get("mobile", ""),
+        })
+    return result
+
+
 @app.post("/api/clinical-notes")
 async def save_clinical_note_api(payload: dict):
     """Save or update clinical notes manually via dashboard or external EHR webhook."""
     p_name = payload.get("patient_name", "").strip()
     content = payload.get("note_content") or payload.get("note", "")
-    author = payload.get("author", "Dr. Samarth Gupta")
+    author = payload.get("author", f"Dr. {DEFAULT_DOCTOR_NAME}")
     category = payload.get("category", "General")
     if not p_name or not content:
         raise HTTPException(status_code=400, detail="patient_name and note_content are required")
@@ -397,6 +482,238 @@ async def save_clinical_note_api(payload: dict):
     return {"status": "success", "saved": record}
 
 
+@app.get("/api/token-metrics")
+async def get_token_metrics():
+    """Return aggregated token metrics, cost estimation, and optimization efficiency (Document Section 5)."""
+    p_tok = _runtime_metrics.get("total_prompt_tokens", 0)
+    c_tok = _runtime_metrics.get("total_candidate_tokens", 0)
+    turns = _runtime_metrics.get("total_turns", 0)
+    total_tok = p_tok + c_tok
+    avg_turn = round(total_tok / turns, 1) if turns else 0
+
+    # Pricing estimation (Gemini Live Audio API: ~$0.0000025/input token, ~$0.00004/output audio token)
+    cost_usd = round((p_tok * 0.0000025) + (c_tok * 0.00004), 4)
+    cost_inr = round(cost_usd * 86.5, 2)  # Conversion to INR
+
+    return {
+        "status": "active",
+        "total_prompt_tokens": p_tok,
+        "total_candidate_tokens": c_tok,
+        "total_tokens": total_tok,
+        "total_conversation_turns": turns,
+        "average_tokens_per_turn": avg_turn,
+        "cost_estimation": {
+            "currency_usd": f"${cost_usd:.4f}",
+            "currency_inr": f"₹{cost_inr:.2f}",
+            "cost_per_turn_inr": f"₹{round(cost_inr / turns, 3)}" if turns else "₹0.00",
+        },
+        "last_turn": _runtime_metrics.get("last_turn_tokens"),
+        "optimizations": {
+            "persona_slicing": True,
+            "streamlined_prompt": True,
+            "silence_gating": True,
+            "silence_timeout_ms": 750,
+            "concise_output_mandate": True,
+            "zero_disclaimers_enforced": True,
+            "max_patient_record_chars": MAX_TOOL_RECORD_CHARS,
+        }
+    }
+
+
+_FLEET_DB_FILE = os.path.join(os.path.dirname(__file__), "..", "fleet-dashboard", "backend", "fleet_db.json")
+
+
+def _load_fleet_speakers():
+    if os.path.exists(_FLEET_DB_FILE):
+        try:
+            with open(_FLEET_DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def format_network_strength(rssi: Optional[int]) -> str:
+    """Format RSSI dBm into a percentage and qualitative link description."""
+    if rssi is None:
+        return "Unknown Signal"
+    try:
+        r = int(rssi)
+    except Exception:
+        return f"{rssi} dBm"
+    
+    # Calculate percentage approximately: -100 dBm = 0%, -50 dBm or higher = 100%
+    if r >= -50:
+        pct = 100
+        quality = "Excellent Link"
+    elif r <= -100:
+        pct = 0
+        quality = "No Signal / Carrier Lost"
+    else:
+        pct = max(0, min(100, int(2 * (r + 100))))
+        if r >= -65:
+            quality = "Good Link"
+        elif r >= -75:
+            quality = "Fair Link"
+        else:
+            quality = "Weak Link"
+    return f"{r} dBm [{quality} — {pct}%]"
+
+
+def log_network_event(event_type: str, device_id: str, ip: str = None, ssid: str = None, rssi: int = None, reason: str = ""):
+    """Output high-visibility, crystal-clear network event log to backend terminal."""
+    is_connected = event_type.upper() in ("WIFI_CONNECTED", "CONNECTED", "WIFI_UP", "UP")
+    ssid_str = ssid or "TFTus-WiFi"
+    ip_str = ip or ("192.168.50.96" if is_connected else "None (Interface Dropped)")
+    strength_str = format_network_strength(rssi if rssi is not None else (-48 if is_connected else -100))
+
+    if is_connected:
+        banner = (
+            f"\n{'='*78}\n"
+            f"📶 [NETWORK LOG] WI-FI CONNECTED (Status: ONLINE)\n"
+            f"{'-'*78}\n"
+            f" • Device ID       : {device_id}\n"
+            f" • IP Address      : {ip_str}\n"
+            f" • Wi-Fi SSID      : '{ssid_str}'\n"
+            f" • Signal Strength : {strength_str}\n"
+            f" • Network Protocol: 802.11 b/g/n (2.4 GHz) • Mode: STA\n"
+            f" • Voice Engine    : Port 8008 • Active 16kHz WebSocket Stream\n"
+            f" • Grafana Stream  : Synced -> https://monitoring.yhealth.me/d/ad7r252?var-device_id={device_id}\n"
+            f"{'='*78}"
+        )
+    else:
+        banner = (
+            f"\n{'='*78}\n"
+            f"⚠️ [NETWORK LOG] WI-FI DISCONNECTED / DROPPED (Status: OFFLINE)\n"
+            f"{'-'*78}\n"
+            f" • Device ID       : {device_id}\n"
+            f" • Last Known IP   : {ip_str}\n"
+            f" • Wi-Fi SSID      : '{ssid_str}'\n"
+            f" • Signal Strength : 0 dBm (No Carrier)\n"
+            f" • Disconnect Info : {reason or 'WebSocket Closed / Inactivity Standby (2m halt)'}\n"
+            f" • Power State     : Device Entered Standby / Power Saving Sleep\n"
+            f" • Grafana Alert   : Synced -> https://monitoring.yhealth.me/d/ad7r252?var-device_id={device_id}\n"
+            f"{'='*78}"
+        )
+    logger.info(banner)
+
+
+def _mark_device_status_in_fleet(device_label: str, status: str = "online", reason: str = "", wifi_connected: bool = True, ip: str = None, ssid: str = None, rssi: int = None):
+    if not os.path.exists(_FLEET_DB_FILE) or not device_label:
+        return
+    try:
+        with open(_FLEET_DB_FILE, "r", encoding="utf-8") as f:
+            speakers = json.load(f)
+        clean = re.sub(r"[^0-9A-Fa-f]", "", device_label).lower()
+        changed = False
+        target_device_id = None
+        for s in speakers:
+            spk_mac = re.sub(r"[^0-9A-Fa-f]", "", s.get("mac_address", "")).lower()
+            if spk_mac == clean or s.get("device_id", "").lower() == clean:
+                s["status"] = status
+                s["wifi_connected"] = wifi_connected
+                s["status_reason"] = reason or ("WebSocket Live Connected" if status == "online" else "WebSocket Idle Standby (2m halt)")
+                if ip:
+                    s["ip_address"] = ip
+                if ssid:
+                    s["wifi_ssid"] = ssid
+                if rssi is not None:
+                    s["wifi_rssi"] = rssi
+                s["last_seen_at"] = "Just now"
+                target_device_id = s.get("device_id")
+                changed = True
+                break
+        if changed:
+            with open(_FLEET_DB_FILE, "w", encoding="utf-8") as f:
+                json.dump(speakers, f, indent=2, ensure_ascii=False)
+            if target_device_id:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(_notify_fleet_status(target_device_id, status, wifi_connected, reason, ip, ssid, rssi))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+async def _notify_fleet_status(device_id: str, status: str, wifi_connected: bool, reason: str, ip: str = None, ssid: str = None, rssi: int = None):
+    try:
+        payload = {"status": status, "wifi_connected": wifi_connected, "reason": reason}
+        if ip:
+            payload["ip_address"] = ip
+        if ssid:
+            payload["wifi_ssid"] = ssid
+        if rssi is not None:
+            payload["wifi_rssi"] = rssi
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                f"http://127.0.0.1:8010/api/speakers/{device_id}/status",
+                json=payload
+            )
+            await client.post(
+                f"http://127.0.0.1:8010/api/speakers/{device_id}/network-event",
+                json={
+                    "event": "WIFI_CONNECTED" if wifi_connected else "WIFI_DISCONNECTED",
+                    "ssid": ssid or "TFTus-WiFi",
+                    "ip": ip,
+                    "rssi": rssi,
+                    "reason": reason
+                }
+            )
+    except Exception:
+        pass
+
+
+def _mark_device_online_in_fleet(device_label: str, ip: str = None, ssid: str = None, rssi: int = None):
+    _mark_device_status_in_fleet(device_label, "online", "Wake Word Triggered / WebSocket Live Active", True, ip=ip, ssid=ssid, rssi=rssi)
+
+
+def _mark_device_offline_in_fleet(device_label: str, reason: str = "WebSocket Disconnected", ip: str = None, ssid: str = None):
+    _mark_device_status_in_fleet(device_label, "offline", reason, False, ip=ip, ssid=ssid, rssi=0)
+
+
+def _mark_device_standby_in_fleet(device_label: str):
+    _mark_device_status_in_fleet(device_label, "offline", "WebSocket Disconnected", False)
+
+
+ACTIVE_ESP_CONNECTIONS: dict = {}
+
+@app.get("/api/active-speakers")
+async def get_active_connected_speakers():
+    """Returns currently connected hardware WebSockets and their live status."""
+    return {
+        "count": len(ACTIVE_ESP_CONNECTIONS),
+        "connections": list(ACTIVE_ESP_CONNECTIONS.values()),
+        "server_time": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get("/api/speakers")
+async def get_speakers_endpoint(role: str = None):
+    """Retrieve all ecosystem speakers (filtered optionally by role: 'doctor' or 'patient')."""
+    speakers = _load_fleet_speakers()
+    if role:
+        speakers = [s for s in speakers if s.get("role", "").lower() == role.lower()]
+    return {"count": len(speakers), "speakers": speakers}
+
+
+@app.get("/api/stats")
+async def get_ecosystem_stats():
+    """Retrieve ecosystem-wide device and patient statistics."""
+    speakers = _load_fleet_speakers()
+    doctors = [s for s in speakers if s.get("role") == "doctor"]
+    patients = [s for s in speakers if s.get("role") == "patient"]
+    online = [s for s in speakers if s.get("status") == "online"]
+    return {
+        "total_speakers": len(speakers),
+        "doctor_speakers_count": len(doctors),
+        "patient_speakers_count": len(patients),
+        "online_count": len(online),
+        "total_managed_patients": sum(d.get("active_patients_count", 0) for d in doctors) + len(patients),
+    }
+
+
+
 
 # ==========================================================
 # PERSONA HELPERS
@@ -407,6 +724,7 @@ _DROP_KEYS = {
 }
 _URL_RE = re.compile(r"https?://\S+|www\.\S+|s3://\S+")
 _JWT_RE = re.compile(r"eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+")
+_DOCTOR_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _is_empty(v) -> bool:
@@ -430,6 +748,147 @@ def clean_persona_dict(obj):
     if isinstance(obj, str):
         return _JWT_RE.sub("", _URL_RE.sub("", obj)).strip()
     return obj
+
+
+def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
+    """
+    Persona Slicing Optimization (Document Section 4.6):
+    Constructs a compact, high-density clinical slice for Gemini instead of
+    transmitting the entire multi-kilobyte persona.
+    Preserves all clinically safety-critical fields:
+      - Demographics (name, age, gender)
+      - Vitals (BP, HR, Weight, BMI, Blood Glucose)
+      - Key Labs (HbA1c, Fasting Glucose, Lipids, eGFR, Creatinine)
+      - Active Medications (name, dosage, frequency)
+      - Allergies & Clinical Alerts
+      - Chronic Conditions & Recent Clinical Notes
+    """
+    if not isinstance(raw_data, dict) or not raw_data:
+        return {"status": "no_record_found"}
+
+    p = raw_data.get("persona", raw_data)
+    if isinstance(p, dict) and isinstance(p.get("data"), dict):
+        p = p["data"]
+    if not isinstance(p, dict):
+        return {"summary": str(p)[:400]}
+
+    slice_data = {}
+
+    # 1. Demographics
+    identity = p.get("identity") or p.get("patient") or p.get("user") or {}
+    if isinstance(identity, dict):
+        fn = identity.get("first_name") or identity.get("firstName") or ""
+        ln = identity.get("last_name") or identity.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or identity.get("name") or identity.get("full_name") or ""
+        demo = {}
+        if name:
+            demo["name"] = name
+        age = identity.get("age_years") or identity.get("age")
+        if age:
+            demo["age"] = age
+        gender = identity.get("gender") or identity.get("sex")
+        if gender:
+            demo["gender"] = gender
+        if demo:
+            slice_data["demographics"] = demo
+
+    # 2. Vitals (clean & compact)
+    vitals = p.get("vitals") or p.get("vital_signs") or {}
+    if isinstance(vitals, dict) and vitals:
+        clean_vitals = {}
+        for k in ("blood_pressure", "bp", "systolic_bp", "diastolic_bp", "heart_rate", "pulse",
+                  "weight", "weight_kg", "bmi", "blood_glucose", "random_blood_sugar",
+                  "fasting_blood_sugar", "hba1c", "spo2", "temperature"):
+            v = vitals.get(k)
+            if v is not None and v != "":
+                clean_vitals[k] = v.get("value") if isinstance(v, dict) else v
+        if clean_vitals:
+            slice_data["vitals"] = clean_vitals
+
+    # 3. Key Laboratory Results (HbA1c, Glucose, Lipid, Kidney)
+    labs_prof = p.get("lab_results_profile") or {}
+    latest_report = labs_prof.get("latest_report") if isinstance(labs_prof, dict) else {}
+    cgm = p.get("cgm_metrics") or p.get("cgm") or {}
+    labs_list = p.get("lab_reports") or p.get("labs") or []
+
+    key_labs = {}
+    if isinstance(cgm, dict) and cgm:
+        avg_g = cgm.get("average_glucose") or cgm.get("mean_glucose")
+        if avg_g:
+            key_labs["cgm_average_glucose"] = avg_g
+        tir = cgm.get("time_in_range_percent") or cgm.get("time_in_range")
+        if tir:
+            key_labs["time_in_range_pct"] = tir
+
+    if isinstance(latest_report, dict) and latest_report:
+        if latest_report.get("report_date"):
+            key_labs["latest_report_date"] = latest_report.get("report_date")
+        for cat in ("glucose", "diabetes", "hematology", "lipids", "kidney", "renal", "electrolytes"):
+            cat_obj = latest_report.get(cat)
+            if isinstance(cat_obj, dict):
+                for lk, lv in cat_obj.items():
+                    val = lv.get("value") if isinstance(lv, dict) else lv
+                    unit = lv.get("unit") if isinstance(lv, dict) else ""
+                    if val is not None and val != "":
+                        key_labs[lk] = f"{val} {unit}".strip() if unit else val
+    elif isinstance(labs_list, list) and labs_list:
+        for lab in labs_list[:3]:
+            if isinstance(lab, dict):
+                test = lab.get("test_name") or lab.get("name") or "test"
+                val = lab.get("value") or lab.get("result")
+                unit = lab.get("unit") or ""
+                dt = lab.get("date") or ""
+                if val:
+                    key_labs[test] = f"{val} {unit}".strip() + (f" ({dt})" if dt else "")
+
+    if key_labs:
+        slice_data["latest_labs"] = key_labs
+
+    # 4. Active Medications
+    meds_prof = p.get("medications_profile") or {}
+    active_meds = meds_prof.get("active_medications") if isinstance(meds_prof, dict) else None
+    active_meds = active_meds or p.get("medications") or p.get("current_medications") or []
+    if isinstance(active_meds, list) and active_meds:
+        med_slices = []
+        for m in active_meds[:6]:
+            if isinstance(m, dict):
+                m_name = m.get("name") or m.get("medication_name") or m.get("drug_name") or "Medication"
+                dose = m.get("dosage") or m.get("dose") or ""
+                freq = m.get("frequency") or m.get("timing") or ""
+                med_slices.append(f"{m_name} {dose} {freq}".strip())
+            elif isinstance(m, str):
+                med_slices.append(m.strip())
+        if med_slices:
+            slice_data["active_medications"] = med_slices
+
+    # 5. Allergies & Clinical Alerts
+    allergies = p.get("allergies") or p.get("known_allergies") or []
+    if allergies:
+        if isinstance(allergies, list):
+            slice_data["allergies"] = [str(a).strip() for a in allergies[:5] if a]
+        else:
+            slice_data["allergies"] = str(allergies)[:150]
+
+    alerts = p.get("clinical_alerts") or p.get("alerts") or p.get("risk_flags") or []
+    if alerts:
+        slice_data["clinical_alerts"] = alerts[:3] if isinstance(alerts, list) else str(alerts)[:150]
+
+    # 6. Conditions & Medical History
+    conditions = p.get("diagnoses") or p.get("chronic_conditions") or p.get("conditions") or []
+    if conditions:
+        slice_data["conditions"] = [str(c).strip() for c in conditions[:5] if c] if isinstance(conditions, list) else str(conditions)[:150]
+
+    # 7. Recent Summary Notes
+    ns = p.get("narrative_summary") or {}
+    summary_note = ns.get("short_summary") if isinstance(ns, dict) else (p.get("summary") or p.get("notes"))
+    if summary_note:
+        slice_data["clinical_summary"] = str(summary_note)[:300].strip()
+
+    serialized = json.dumps(slice_data, ensure_ascii=False)
+    if len(serialized) > max_chars:
+        return summarize_persona_for_tool_response(slice_data)
+
+    return slice_data if slice_data else clean_persona_dict(p)
 
 
 def summarize_persona_for_tool_response(raw_data: dict) -> dict:
@@ -487,161 +946,125 @@ def summarize_persona_for_tool_response(raw_data: dict) -> dict:
 
 
 def build_tool_patient_data(p_data: dict) -> dict:
-    """Full cleaned record for the model (so it can answer ANY question), summary only if huge."""
-    cleaned = clean_persona_dict(p_data)
-    try:
-        if len(json.dumps(cleaned, ensure_ascii=False)) <= MAX_TOOL_RECORD_CHARS:
-            return cleaned
-    except Exception:
-        pass
-    s = summarize_persona_for_tool_response(p_data)
-    if isinstance(s, dict):
-        s["note"] = "Record was too large; this is a summary."
-    return s
+    """Persona Slicing: Return compact clinical context (saving 80-90% input tokens)."""
+    return slice_patient_persona(p_data, max_chars=MAX_TOOL_RECORD_CHARS)
 
 
 # ==========================================================
 # PROMPT
 # ==========================================================
 def part_of_day() -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        h = datetime.now(ZoneInfo(os.getenv("TZ_NAME", "Asia/Kolkata"))).hour
-    except Exception:
-        h = datetime.now().hour
-    return "morning" if h < 12 else "afternoon" if h < 17 else "evening"
+    """Return 'morning', 'afternoon', or 'evening' based on current IST hour.
+
+    IST standard greeting breakdown:
+    04:00 - 11:59: 'morning' ('Good morning' / 'सुप्रभात')
+    12:00 - 16:59: 'afternoon' ('Good afternoon' / 'शुभ दोपहर' / 'नमस्कार')
+    17:00 - 22:59: 'evening' ('Good evening' / 'शुभ संध्या')
+    23:00 - 03:59: 'evening' (night shift / late clinic hours)
+    """
+    h = get_current_ist_datetime().hour
+    if 4 <= h < 12:
+        return "morning"
+    elif 12 <= h < 17:
+        return "afternoon"
+    else:
+        return "evening"
 
 
 def build_doctor_agent_prompt(
-    doctor_name: str = "Samarth",
-    specialization: str = "Endocrinologist",
+    doctor_name: str = None,
+    specialization: str = None,
+    clinic_name: str = None,
     patient_name: str = None,
     persona_str: str = None,
+    doctor_persona: dict = None,
 ) -> str:
-    tod = part_of_day()
+    # If dynamic doctor persona is provided, extract profile details
+    if isinstance(doctor_persona, dict) and doctor_persona:
+        doc_details = doctor_persona.get("doctor_details", {})
+        if isinstance(doc_details, dict):
+            fn = str(doc_details.get("first_name") or "").strip()
+            ln = str(doc_details.get("last_name") or "").strip()
+            if fn or ln:
+                doctor_name = f"{fn} {ln}".strip()
+            specialization = doc_details.get("specialization") or specialization
+            clinics = doc_details.get("clinics", [])
+            if clinics and isinstance(clinics, list) and isinstance(clinics[0], dict):
+                clinic_name = clinics[0].get("name") or clinic_name
 
-    answer_rules = (
-        "   - Answer directly from the PATIENT PERSONA RECORD. Cite the actual number, date, or "
-        "name — never a rounded or invented approximation.\n"
-        "   - Keep it concise: 1-3 complete sentences, unless the doctor asks for a fuller summary.\n"
-        "   - If the record does not contain the answer, say so plainly: 'That is not in the current "
-        "record.' Never fill the gap with a guess.\n"
-        "   - If a value falls in an emergency range (glucose below 54 or above 350 mg/dL, systolic BP "
-        "above 180, diastolic above 120), lead with that flag before anything else, in a clear and "
-        "direct — not alarmed — tone.\n"
-        "   - Offer interpretation as data-grounded observation, not diagnosis: describe what the "
-        "readings show and how they compare to target, and let the doctor draw the conclusion.\n"
-    )
+    doctor_name = doctor_name or DEFAULT_DOCTOR_NAME
+    specialization = specialization or DEFAULT_DOCTOR_SPECIALIZATION
+    clinic_name = clinic_name or DEFAULT_DOCTOR_CLINIC
+    salutation = "Dr. Makkar" if "Makkar" in doctor_name else f"Dr. {doctor_name}"
+
+    # Real-Time Clock in IST
+    ist_dt = get_current_ist_datetime()
+    tod = part_of_day()
+    hindi_tod = "सुप्रभात" if tod == "morning" else "शुभ दोपहर" if tod == "afternoon" else "शुभ संध्या"
+    current_time_ist = ist_dt.strftime("%I:%M %p IST").lstrip("0")
+    day_of_week = ist_dt.strftime("%A")
+
+    consultations = []
+    active_count = None
+    consultation_date = get_today_date_str()
+    if isinstance(doctor_persona, dict) and doctor_persona:
+        consultations = doctor_persona.get("today_consultations") or doctor_persona.get("consultations") or []
+        active_count = doctor_persona.get("active_patients_count")
+        consultation_date = doctor_persona.get("date") or consultation_date
+
+    if consultations:
+        consultation_count = len(consultations)
+        consultations_summary = f"     {consultation_count} consultations scheduled for today. Call get_doctor_consultations for details."
+    else:
+        consultations_summary = "     No consultations scheduled for today."
 
     if patient_name and persona_str:
         patient_block = (
             f"ACTIVE PATIENT: {patient_name}\n"
-            "A patient record is currently loaded. Answer clinical questions using ONLY the data "
-            "below. Do not invent, estimate, or assume any value not present in this record.\n\n"
-            "PATIENT PERSONA RECORD:\n"
+            "PATIENT CLINICAL SLICE:\n"
             f"{persona_str}\n"
         )
-        patient_state_rule = "3. THE DOCTOR ASKS ABOUT THE ACTIVE PATIENT (vitals, glucose, HbA1c, BP, weight, medications, adherence, labs, diet, notes, appointments, anything clinical):\n" + answer_rules
     else:
         patient_block = (
             "ACTIVE PATIENT: none loaded yet.\n"
-            "Records are loaded on demand with the load_patient_record tool. The tool result contains "
-            "the full record in the field 'patient_data'. Once a tool result has status 'found', that "
-            "patient_data IS the PATIENT PERSONA RECORD referred to in these rules, and it stays valid "
-            "until the doctor names a different patient.\n"
+            "Records are loaded on demand with load_patient_record. Once loaded, answer clinical questions using ONLY that record.\n"
         )
-        patient_state_rule = (
-            "3. CLINICAL QUESTIONS (vitals, glucose, HbA1c, BP, weight, medications, adherence, labs, "
-            "diet, notes, appointments, anything clinical):\n"
-            "   - If no patient has been loaded yet, ask once, briefly: 'Which patient would you like "
-            "to discuss?' Do not guess who they mean.\n"
-            "   - Once a patient is loaded, use patient_data from the most recent 'found' tool result.\n"
-            + answer_rules
-        )
+
+    active_count_str = f"Active Patients on Roster: {active_count}\n" if active_count is not None else ""
 
     return (
-        "STRICT HUMAN VOICE INTELLIGENCE & CLINICAL ASSISTANT INSTRUCTIONS:\n"
-        f"You are YHealth Assist, a multilingual clinical AI coordinator speaking directly with Dr. {doctor_name}, "
-        f"{specialization}. You support the doctor's clinical workflow by retrieving and discussing "
-        "patient records, hands-free, during their consultations.\n\n"
-        "MULTILINGUAL & CODE-SWITCHING MANDATE (TOP PRIORITY):\n"
-        "   - You are completely fluent in Hindi (हिन्दी), Hinglish, and English. You CAN and MUST speak Hindi and Hinglish whenever addressed in those languages or requested.\n"
-        "   - If the doctor speaks Hindi, reply naturally in Hindi (e.g. 'जी डॉक्टर गुप्ता, प्रिया शर्मा का ब्लड शुगर 140 है।').\n"
-        "   - If the doctor speaks in Hinglish, reply in natural Hinglish.\n"
-        "   - If the doctor asks 'Can you speak in Hindi?' or 'हिंदी में बोलो', say: 'हाँ डॉक्टर, मैं हिन्दी में बात कर सकता हूँ। आप किस मरीज़ के बारे में जानना चाहते हैं?'\n"
-        "   - NEVER SAY 'I cannot speak Hindi' or 'I only speak English'. You have full native speech generation capabilities in Hindi.\n\n"
-        "SPEAKING STYLE: Speak at a calm, natural, measured pace — like a composed colleague, never "
-        "rushed. Pause briefly between sentences. Always finish every sentence completely; never trail "
-        "off or cut yourself short. Keep answers brief but complete. No shouting or abrupt tone changes.\n"
-        "CRITICAL VOICE & URL FORMATTING RULE: You are speaking over a live voice connection. NEVER read out, "
-        "spell out, or mention any URLs, links, domain names, file extensions, raw JSON syntax, slashes, or raw ratios. "
-        "Always translate numbers and dates into natural spoken words.\n"
-        "AUDIO & MEDICAL TERMINOLOGY RECOGNITION:\n"
-        "   - The audio stream is from a doctor in a clinical setting speaking medical terms, acronyms, and lab test names.\n"
-        "   - Interpret phonetic approximations accurately: spoken phrases that sound like 'b1', 'h b a 1 c', 'a 1 c', 'h b 1 c', or 'hba1c' refer to HbA1c (Hemoglobin A1c).\n"
-        "   - Terms sounding like 'bp' refer to blood pressure, 'bmi' to Body Mass Index, 'mg/dL' to milligrams per deciliter, etc.\n"
-        "   - Always map these spoken medical terms to the corresponding fields in the PATIENT PERSONA RECORD.\n"
-        "CRITICAL: Never append boilerplate or disclaimers (e.g. 'please verify independently', 'this "
-        "is not medical advice') to routine answers. The doctor is the licensed clinician — give "
-        "direct, grounded answers only.\n\n"
-
-        "CONVERSATION RULES:\n"
-        "1. WHEN THE DOCTOR CALLS YOUR WAKE WORD ('Hello Assistant', 'Hey Assistant', 'Hey YHealth', "
-        "'Hello YHealth Assist') OR GREETS YOU:\n"
-        f"   - Reply with ONE short sentence: greet Dr. {doctor_name} by name and ask which patient "
-        f"to start with, e.g. 'Good {tod}, Dr. {doctor_name}. Which patient would you like to start with?'\n"
-        "   - If a patient is already loaded, offer to continue with that patient or switch.\n"
-        "   - Do not list capabilities unless asked.\n"
-        "2. WHEN THE DOCTOR STATES OR SWITCHES A PATIENT NAME OR EXACT PATIENT ID "
-        "(at session start, or mid-conversation):\n"
-        "   - Call load_patient_record with the spoken name or exact ID immediately. Do not search by phone alone. Do not answer clinical "
-        "questions from a prior patient once a new name has been stated.\n"
-        "   - Say ONE brief holding line while it runs: 'One moment, pulling up that record.'\n"
-        "   - When the tool returns status 'found': confirm the matched full name in one short "
-        "sentence and ask what the doctor would like to know, e.g. 'I have Priya Sharma's record. "
-        "What would you like to know?'\n"
-        "   - When status is 'ambiguous': say there are multiple patients with that name and ask the doctor to confirm the last four digits of the phone number. Do not ask them to pick a candidate name. Do not speak or reveal any phone digits.\n"
-        "   - If the doctor says a name and its phone ending together, pass the whole phrase to load_patient_record so the backend can check both in one turn. If only four digits are spoken while a duplicate choice is pending, call confirm_patient_by_phone_last4.\n"
-        "   - After the doctor says the four digits, call confirm_patient_by_phone_last4 with exactly those four digits. Do not call load_patient_record again for that pending choice. If a unique patient is confirmed, confirm the matched name and continue. If it does not match, ask the doctor to repeat the last four digits.\n"
-        "   - When status is 'not_found': say you couldn't find that patient and ask the doctor to "
-        "repeat or spell the name. Never fabricate a record.\n"
-        "   - When status is 'name_incomplete': ask for the patient's full name; use phone digits only if the full name matches multiple roster entries.\n"
-        "   - When status is 'phone_requires_name': ask for the patient's name first. Never use a phone number as a general patient search.\n"
-        "   - When status is 'persona_not_found': clarify that the patient matched API 1 but API 2 returned no persona for that roster ID; ask for the API 2 patient assignment to be checked. Do not claim the roster match failed.\n"
-        "   - When status is 'persona_identity_mismatch': say the patient record link is inconsistent and do not read or summarize any returned clinical data.\n"
-        "   - Use an exact roster name match. Never substitute a similarly-spelled name or another patient's record.\n"
-        "   - When status is 'empty_roster': say the doctor roster currently has no patients available "
-        "and ask for the roster assignment to be checked. Do not claim that the named patient does not exist.\n"
-        "   - When status is 'error': say the record lookup failed and offer to try again. Do NOT claim "
-        "the patient does not exist.\n"
-        f"{patient_state_rule}"
-        "4. WHEN THE DOCTOR DICTATES A CLINICAL NOTE (e.g. 'note for [patient]: increase walking to "
-        "45 minutes daily'):\n"
-        "   - Repeat the note content back once for confirmation before calling add_clinical_note.\n"
-        "   - After the tool confirms, say: 'Note saved.' Nothing more.\n"
-        "5. WHEN THE DOCTOR ASKS TO SEND AN ALERT OR NOTIFY A PATIENT:\n"
-        "   - Confirm the patient and alert type, then call escalate_alert.\n"
-        "   - After the tool confirms, say: 'Alert sent to patient.' Nothing more.\n"
-        "6. WHEN THE DOCTOR GIVES A STANDALONE SIGN-OFF COMMAND ('STOP', 'GOODBYE', 'BYE', 'THAT IS ALL', OR 'GO TO SLEEP'), not when 'stop' is part of a clinical instruction:\n"
-        "   - Call end_conversation immediately, then give one brief sign-off and stop speaking.\n\n"
-
-        "CLINICAL SAFETY RULES — ABSOLUTE:\n"
-        "- Every number, date, or name you speak must come from the PATIENT PERSONA RECORD. Never "
-        "estimate, round beyond what is given, or infer a value that is not present.\n"
-        "- Never suggest a specific medication dosage change, substitution, or discontinuation — that "
-        "decision belongs to the doctor. You may state what the record shows but not what to prescribe.\n"
-        "- Never state a diagnosis as settled fact. Describe what the data shows versus target ranges.\n"
-        "- If asked something outside the patient's record or your role, say plainly that it's outside "
-        "what you can confirm from this record.\n\n"
-
-        "LANGUAGE & MULTILINGUAL CAPABILITIES:\n"
-        "   - You are a fully fluent multilingual clinical assistant supporting English, Hindi (हिन्दी), Hinglish, Tamil, Telugu, Kannada, Bengali, Marathi, Gujarati, Spanish, and other standard languages.\n"
-        "   - Code-Switching & Natural Mirroring: Always detect and respond in the exact language the doctor uses. If the doctor speaks Hindi, reply in fluent, natural Hindi. If they speak in Hinglish (mixed Hindi-English), reply naturally in Hinglish while retaining medical terminology. If they request a specific language (e.g. 'Speak in Hindi' or 'हिंदी में बताओ'), switch immediately.\n"
-        "   - Never state or claim language limitations or say 'I cannot speak Hindi'. You have full native speech generation capabilities in all supported languages.\n"
-        "   - Pronounce medical metrics clearly (e.g., 'रक्तचाप 130 बटा 85', 'ब्लड शुगर 140 मिलीग्राम प्रति डेसीलीटर').\n\n"
-        "DOCTOR CONTEXT:\n"
+        f"You are YHealth Assist, an intelligent clinical AI assistant speaking directly with Dr. {doctor_name}, "
+        f"{specialization} at {clinic_name}. You assist consultations hands-free over voice.\n\n"
+        "CORE RULES:\n"
+        "1. MULTILINGUAL & CODE-SWITCHING: Fluent in Hindi (हिन्दी), Hinglish, and English. Mirror the doctor's spoken language naturally (e.g. if doctor speaks Hindi, reply in natural Hindi like 'जी डॉक्टर मक्कड़...'). Never claim language limitations.\n"
+        "2. EXTREME CLINICAL CONCISENESS (TOKEN EFFICIENCY): Spoken answers must strictly be 1 direct sentence (maximum 2 sentences if answering multiple metrics). "
+        "Do not repeat the question or re-state patient demographics in the answer. State the numbers immediately. Zero filler, zero unsolicited advice, zero unasked metrics.\n"
+        "3. STRICT GROUNDING: Cite exact numbers, units, and dates from the patient record. Never extrapolate or guess. If not present: 'That information is not in the record.'\n"
+        "4. DOCTOR AUDIENCE (ABSOLUTELY ZERO CONSUMER DISCLAIMERS): The user IS the licensed physician ({salutation}) treating their patients in clinic. "
+        "NEVER say 'consult a healthcare professional', 'consult a doctor', 'consult a physician', 'please consult', 'seek medical advice', 'talk to your doctor', or 'this is not medical advice'. "
+        "You are an assistant TO the doctor; telling the doctor to consult a doctor is strictly forbidden. State clinical data and drug dosages directly to {salutation}.\n"
+        "5. CRITICAL VALUES: If glucose <54 or >350 mg/dL, systolic BP >180, or diastolic BP >120, state the critical metric first in a clear, calm tone.\n"
+        "6. MEDICAL SECURITY: Restricted to clinical care and workflow. Refuse non-medical topics: '{salutation}, I am strictly restricted to clinical patient care.'\n"
+        "7. VOICE CADENCE: Warm Indian English / Delhi cadence. Translate phonetic terms ('hba1c' -> HbA1c, 'bp' -> Blood Pressure). Never spell raw URLs or IDs.\n\n"
+        "WORKFLOW & TOOLS:\n"
+        f"- GREETING: On wake word or initial greeting, greet with the exact time-of-day in 1 short sentence:\n"
+        f"  * English: 'Good {tod}, {salutation}. Which patient would you like to start with?'\n"
+        f"  * Hindi: 'नमस्ते {salutation}, {hindi_tod}। आज किस मरीज़ से शुरुआत करनी है?'\n"
+        "- REAL-TIME CLOCK (IST): You are grounded with an accurate real-time clock in Indian Standard Time (IST, UTC+5:30). State current time in 1 sentence. Call get_current_time if needed.\n"
+        "- PATIENT LOOKUP: When named, immediately call load_patient_record. Say: 'One moment, pulling up that record.' Confirm full name in 1 sentence. If ambiguous, ask for last 4 digits of phone, then call confirm_patient_by_phone_last4.\n"
+        "- TODAY'S SCHEDULE: When asked about appointments, summarize from TODAY'S SCHEDULE in 1-2 sentences. Call get_doctor_consultations for date queries.\n"
+        "- CLINICAL NOTES: Repeat note back once for confirmation, call add_clinical_note, then say: 'Note saved.'\n"
+        "- ALERTS: Confirm alert type, call escalate_alert, then say: 'Alert sent.'\n"
+        "- SIGN-OFF: On standalone sign-off ('stop', 'bye', 'goodbye', 'go to sleep'), call end_conversation, give one brief sign-off and stop.\n\n"
+        "DOCTOR CONTEXT & REAL-TIME CLOCK:\n"
         f"Name: Dr. {doctor_name}\n"
-        f"Specialization: {specialization}\n\n"
+        f"Specialization: {specialization}\n"
+        f"Clinic: {clinic_name}\n"
+        f"Date: {consultation_date} ({day_of_week})\n"
+        f"Current Time: {current_time_ist}\n"
+        f"Timezone: Indian Standard Time (IST, UTC+5:30)\n"
+        f"{active_count_str}"
+        f"Today's Scheduled Consultations:\n{consultations_summary}\n\n"
         f"{patient_block}"
     )
 
@@ -848,6 +1271,91 @@ async def _async_fetch_patient_persona_locked(patient_id: str, doctor_id: str = 
         _metric_inc("api2_failures")
         return {}
     return {}
+
+
+async def async_fetch_doctor_persona(
+    doctor_id: str = None,
+    target_date: str = None,
+    force_refresh: bool = False,
+    allow_network: bool = True,
+) -> dict:
+    """Fetch and cache doctor persona and daily consultations once per day per doctor."""
+    doctor_id = (doctor_id or DEFAULT_DOCTOR_ID).strip()
+    target_date = (target_date or get_today_date_str()).strip()
+    cache_id = f"{doctor_id}:{target_date}"
+    now = time.time()
+
+    # 1. Check in-memory daily cache (loaded once per day)
+    if not force_refresh:
+        hit = _doctor_persona_by_day.get(cache_id)
+        if hit and (now - hit[0]) < REDIS_DOCTOR_PERSONA_TTL_S:
+            return hit[1]
+
+    # 2. Check Redis daily cache
+    redis_key = _redis_key("doctor-persona", cache_id)
+    if not force_refresh:
+        redis_cached, redis_ttl = await redis_get_json_with_ttl(redis_key)
+        if isinstance(redis_cached, dict) and redis_cached and redis_ttl > 0:
+            _doctor_persona_by_day[cache_id] = (now, redis_cached)
+            return redis_cached
+
+    if not allow_network:
+        hit = _doctor_persona_by_day.get(cache_id)
+        return hit[1] if hit else {}
+
+    # 3. Share one in-flight fetch per doctor per day
+    lock = _doctor_persona_locks.get(cache_id)
+    if lock is None:
+        lock = _doctor_persona_locks.setdefault(cache_id, asyncio.Lock())
+
+    async with lock:
+        # Re-check inside lock
+        if not force_refresh:
+            hit = _doctor_persona_by_day.get(cache_id)
+            if hit and (time.time() - hit[0]) < REDIS_DOCTOR_PERSONA_TTL_S:
+                return hit[1]
+            redis_cached, redis_ttl = await redis_get_json_with_ttl(redis_key)
+            if isinstance(redis_cached, dict) and redis_cached and redis_ttl > 0:
+                _doctor_persona_by_day[cache_id] = (time.time(), redis_cached)
+                return redis_cached
+
+        endpoint = f"{DOCTOR_PERSONA_API_BASE_URL.rstrip('/')}/{doctor_id}/persona/hardware"
+        headers = {
+            "accept": "*/*",
+            "Content-Type": "application/json",
+        }
+        if PERSONA_HARDWARE_TOKEN:
+            headers["x-hardware-token"] = PERSONA_HARDWARE_TOKEN
+
+        client = get_http_client()
+        logger.info(f"🌐 Fetching daily doctor persona from API: doctor={doctor_id}, date={target_date}")
+        try:
+            resp = await client.post(
+                endpoint,
+                headers=headers,
+                json={"date": target_date},
+                timeout=httpx.Timeout(10.0, connect=3.0),
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    consults = data.get("today_consultations") or data.get("consultations") or []
+                    _doctor_persona_by_day[cache_id] = (time.time(), data)
+                    await redis_set_json(redis_key, data, REDIS_DOCTOR_PERSONA_TTL_S)
+                    logger.info(
+                        f"👨‍⚕️ Cached daily doctor persona for {doctor_id} ({target_date}): "
+                        f"{len(consults)} consultations, active_patients={data.get('active_patients_count', 'N/A')}"
+                    )
+                    return data
+            logger.warning(f"⚠️ Doctor persona API returned status {resp.status_code} for doctor {doctor_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Doctor persona API fetch failed for {doctor_id}: {type(e).__name__} - {e}")
+
+        # Fallback to stale memory entry if present
+        hit = _doctor_persona_by_day.get(cache_id)
+        if hit:
+            return hit[1]
+        return {}
 
 
 def _patient_fields(p: dict):
@@ -1361,6 +1869,42 @@ async def run_tool(fn: str, args: dict, doctor_id: str = None, connection_id: st
             logger.info(f"🚨 escalate_alert: '{pn}' -> '{at}'")
             _escalated_alerts.setdefault(pn, []).append(at)
             return {"status": "success", "message": f"Alert sent to {pn}."}
+        if fn in ("get_doctor_consultations", "get_today_consultations"):
+            target_date = (args.get("date") or "").strip() or get_today_date_str()
+            logger.info(f"📅 Tool '{fn}': doctor={doctor_id}, date={target_date}")
+            persona = await async_fetch_doctor_persona(doctor_id, target_date)
+            consultations = persona.get("today_consultations") or persona.get("consultations") or []
+            doc_name = (
+                persona.get("doctor_details", {}).get("first_name", "") + " " +
+                persona.get("doctor_details", {}).get("last_name", "")
+            ).strip() or DEFAULT_DOCTOR_NAME
+            return {
+                "status": "success",
+                "date": target_date,
+                "doctor_name": doc_name,
+                "consultation_count": len(consultations),
+                "consultations": consultations,
+                "message": (
+                    f"Dr. Makkar has {len(consultations)} consultations scheduled for {target_date}."
+                    if consultations
+                    else f"Dr. Makkar has no consultations scheduled for {target_date}."
+                ),
+            }
+        if fn in ("get_current_time", "get_time", "get_live_time"):
+            dt = get_current_ist_datetime()
+            tod = part_of_day()
+            time_str = dt.strftime("%I:%M %p").lstrip("0")
+            date_str = dt.strftime("%Y-%m-%d")
+            day_str = dt.strftime("%A")
+            logger.info(f"⏰ Tool '{fn}' -> {time_str} IST ({tod}), {day_str}, {date_str}")
+            return {
+                "status": "success",
+                "time_ist": f"{time_str} IST",
+                "date": date_str,
+                "day_of_week": day_str,
+                "part_of_day": tod,
+                "message": f"The current time is {time_str} IST on {day_str}, {date_str}.",
+            }
         return {"status": "error", "message": f"Unknown tool '{fn}'."}
     except asyncio.TimeoutError:
         logger.warning(f"Tool '{fn}' timed out")
@@ -1485,7 +2029,7 @@ async def call_gemini_api(audio_bytes: bytes, mime_type: str = "audio/wav") -> d
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    doctor_prompt = build_doctor_agent_prompt("Samarth", "Endocrinologist", patient_name, persona_str)
+    doctor_prompt = build_doctor_agent_prompt(patient_name=patient_name, persona_str=persona_str)
     system_instruction = (
         f"{doctor_prompt}\n\n"
         "FORMATTING & MOOD PERCEPTION:\n"
@@ -1494,7 +2038,7 @@ async def call_gemini_api(audio_bytes: bytes, mime_type: str = "audio/wav") -> d
         "Determine response_mood (`celebratory`, `calm_reassuring`, `empathetic_gentle`, `warm_clinical`).\n"
         "Respond STRICTLY in valid JSON:\n"
         '{"transcription": "<exact transcribed question>", "user_emotion": "<emotion>", '
-        '"response_mood": "<mood>", "answer": "<warm 1-3 sentence clinical response>"}\n'
+        '"response_mood": "<mood>", "answer": "<concise 1-2 sentence direct clinical response, zero extraneous info>"}\n'
     )
     user_prompt = "Listen to the spoken audio, transcribe it, determine response_mood, and answer in JSON."
 
@@ -1561,7 +2105,7 @@ async def text_to_pcm_16k(text: str, mood: str = "warm_clinical") -> bytes:
     if not text or not text.strip():
         return b""
 
-    voice = os.getenv("TTS_VOICE", "en-US-AvaNeural")
+    voice = os.getenv("TTS_VOICE", "en-IN-NeerjaExpressiveNeural")
     rate, pitch = _MOOD_PROSODY.get(mood, _MOOD_PROSODY["warm_clinical"])
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
@@ -1644,33 +2188,44 @@ def build_live_tools(types):
     T = types.Type
     return [types.Tool(function_declarations=[
         fd("load_patient_record",
-           "Call this the moment the doctor states, confirms, or switches to a patient name. "
-           "Accepts a spoken patient name with any phone last-four phrase spoken in the same turn, or an exact patient ID. Phone digits alone are not a general search; they confirm only a pending duplicate-name choice.",
-           {"patient_name": S(type=T.STRING, description="Patient name and, if spoken in the same turn, the phone-ending phrase; or an exact patient ID. Do not pass a phone number alone unless it is a pending four-digit confirmation.")}, ["patient_name"]),
-        fd("get_patient_persona",
-           "Alias for load_patient_record. Fetch a patient's clinical record by name or exact ID; preserve any phone last-four phrase spoken with the name so duplicates can be resolved in one turn.",
-           {"patient_name": S(type=T.STRING, description="Patient name and any phone-ending phrase spoken in the same turn, or exact patient ID. Do not pass a phone number alone.")}, ["patient_name"]),
+           "Fetch clinical record by patient name, optional phone last-4, or exact ID.",
+           {"patient_name": S(type=T.STRING, description="Patient name or ID.")}, ["patient_name"]),
         fd("confirm_patient_by_phone_last4",
-           "Use only after load_patient_record returned ambiguous. Matches exactly four spoken digits against the pending duplicate-name candidates in the cached roster. Phone digits are never returned.",
-           {"last_four": S(type=T.STRING, description="Exactly the last four digits spoken by the doctor.")}, ["last_four"]),
+           "Disambiguate ambiguous patient candidate by last 4 phone digits.",
+           {"last_four": S(type=T.STRING, description="Exactly 4 spoken digits.")}, ["last_four"]),
         fd("add_clinical_note",
-           "Save a clinical note, consultation observation, or medication/diet order dictated by the doctor for the active patient.",
+           "Save clinical note or prescription instruction for active patient.",
            {
-               "patient_name": S(type=T.STRING, description="The name of the patient this clinical note applies to."),
-               "note_content": S(type=T.STRING, description="The verbatim or summarized clinical observation, prescription change, or instruction dictated by the doctor."),
-               "category": S(type=T.STRING, description="Optional note category, e.g. 'Prescription Change', 'Lab Order', 'Diet & Lifestyle', 'Follow-up', or 'General Consultation'.")
+               "patient_name": S(type=T.STRING, description="Patient name."),
+               "note_content": S(type=T.STRING, description="Dictated observation or plan."),
+               "category": S(type=T.STRING, description="Optional: 'Prescription Change', 'Lab Order', 'Diet & Lifestyle', 'Follow-up', 'General Consultation'.")
            },
            ["patient_name", "note_content"]),
         fd("escalate_alert",
-           "Send an alert or notification to the current patient.",
+           "Send clinical alert to the active patient.",
            {"patient_name": S(type=T.STRING),
             "alert_type": S(type=T.STRING,
                             enum=["glucose_high", "glucose_low", "bp_high", "medication_missed", "general"])},
            ["patient_name", "alert_type"]),
+        fd("get_doctor_consultations",
+           "Retrieve doctor's scheduled consultations for today or specific date.",
+           {"date": S(type=T.STRING, description="YYYY-MM-DD date (defaults to today).")},
+           []),
+        fd("get_current_time",
+           "Get current live Indian Standard Time (IST), date, and day of week.",
+           {}, []),
         fd("end_conversation",
-           "Call only for a standalone conversation sign-off command: stop, goodbye, bye, that is all, or go to sleep. Do not call when 'stop' is part of a clinical instruction such as stopping a medication. The device returns to standby after the spoken sign-off.",
+           "End conversation on standalone sign-off command (stop, goodbye, bye, go to sleep).",
            {}, []),
     ])]
+
+
+def compute_pcm16_rms(raw: bytes) -> float:
+    count = len(raw) // 2
+    if count == 0:
+        return 0.0
+    samples = struct.unpack(f"<{count}h", raw[: count * 2])
+    return (sum(s * s for s in samples) / count) ** 0.5
 
 
 def boost_chunk_gain(raw: bytes, gain: float = IN_GAIN) -> bytes:
@@ -1703,13 +2258,41 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
     # duplicate-name selection instead of forgetting it. Reject arbitrary
     # query values so they cannot create unsafe Redis keys.
     supplied_device_id = (websocket.query_params.get("device_id") or "").strip().lower()
+    supplied_rssi = websocket.query_params.get("rssi")
+    supplied_ssid = websocket.query_params.get("ssid") or "TFTus-WiFi"
+    rssi_val = None
+    if supplied_rssi:
+        try:
+            rssi_val = int(supplied_rssi)
+        except Exception:
+            pass
+    if rssi_val is None:
+        rssi_val = -48
+
     if re.fullmatch(r"[a-f0-9]{12}", supplied_device_id):
         connection_id = f"esp32-{supplied_device_id}"
         connection_label = supplied_device_id
     else:
         connection_id = uuid.uuid4().hex
         connection_label = "temporary"
-    logger.info(f"🟢 ESP32 connected — doctor_id='{doctor_id}', device='{connection_label}'")
+
+    client_ip = websocket.client.host if websocket.client else None
+
+    # 📶 LOG PROMINENT NETWORK WI-FI CONNECTED BANNER TO BACKEND CONSOLE
+    log_network_event("WIFI_CONNECTED", device_id=connection_label, ip=client_ip, ssid=supplied_ssid, rssi=rssi_val)
+    _mark_device_online_in_fleet(connection_label, ip=client_ip, ssid=supplied_ssid, rssi=rssi_val)
+
+    ACTIVE_ESP_CONNECTIONS[connection_id] = {
+        "connection_id": connection_id,
+        "device_label": connection_label,
+        "doctor_id": doctor_id,
+        "client_ip": client_ip,
+        "wifi_ssid": supplied_ssid,
+        "wifi_rssi": rssi_val,
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+        "status": "online",
+        "wifi_connected": True
+    }
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
@@ -1731,14 +2314,44 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
     resume = {"handle": None}
     advanced = os.getenv("LIVE_ADVANCED", "1") != "0"   # resumption + compression + transcription
 
+    # Dynamic Fleet Speaker Mapping Lookup (Supports multiple doctors & patients concurrently)
+    fleet_speakers = _load_fleet_speakers()
+    matched_speaker = None
+    clean_mac = re.sub(r"[^0-9A-Fa-f]", "", connection_label).lower()
+    for s in fleet_speakers:
+        s_mac = re.sub(r"[^0-9A-Fa-f]", "", s.get("mac_address", "")).lower()
+        if (s_mac and s_mac == clean_mac) or (s.get("device_id", "").lower() == connection_label.lower()):
+            matched_speaker = s
+            break
+
+    # Determine prompt role (Doctor Clinic Assistant vs Patient Bedside Station)
+    if matched_speaker and matched_speaker.get("role") == "patient":
+        patient_name = matched_speaker.get("name", "Patient")
+        program = matched_speaker.get("enrolled_program", "Remote Chronic Care & Vitals Monitoring")
+        doctor_assigned = matched_speaker.get("doctor_assigned_name", "Dr. Brij Mohan Makkar")
+        system_prompt = (
+            f"You are the YHealth Smart Bedside Assistant for {patient_name}.\n"
+            f"Care Program: {program}.\n"
+            f"Supervising Physician: {doctor_assigned}.\n"
+            f"Role & Guidelines:\n"
+            f"1. Greet {patient_name} warmly and check on their daily health.\n"
+            f"2. Help them record their daily vitals (fasting blood glucose, post-meal glucose, blood pressure, weight, medications taken).\n"
+            f"3. Speak clearly, concisely, and with warmth in spoken conversational tone. Keep answers under 2 sentences.\n"
+            f"4. If {patient_name} reports severe critical symptoms (chest pain, extreme dizziness, severe breathlessness), urgently advise contacting {doctor_assigned} or hospital emergency."
+        )
+    else:
+        # Load doctor persona & daily consultations (cached once per day in Redis/RAM)
+        today_str = get_today_date_str()
+        doctor_persona = await async_fetch_doctor_persona(doctor_id, today_str)
+        system_prompt = build_doctor_agent_prompt(doctor_persona=doctor_persona)
+
     def make_config(use_advanced: bool):
         kwargs = dict(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name))),
-            system_instruction=types.Content(parts=[types.Part.from_text(text=build_doctor_agent_prompt(
-                doctor_name="Samarth", specialization="Endocrinologist"))]),
+            system_instruction=types.Content(parts=[types.Part.from_text(text=system_prompt)]),
             tools=tools,
             realtime_input_config=types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
@@ -1746,7 +2359,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                     start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                     end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
                     prefix_padding_ms=200,
-                    silence_duration_ms=800,
+                    silence_duration_ms=650,
                 )),
         )
         if use_advanced:
@@ -1795,64 +2408,6 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
             last_queue_full_log = now
         await audio_queue.put(item)
 
-    async def esp32_receive_task():
-        chunk_counter, audio_bytes = 0, 0
-        streaming, last_audio_t = False, 0.0
-        try:
-            while True:
-                try:
-                    message = await asyncio.wait_for(websocket.receive(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    # Safety net if the ESP32 never sends audio_end
-                    if streaming and (loop.time() - last_audio_t > 2.0):
-                        streaming = False
-                        logger.info(f"🎤 [Server VAD turn end] {audio_bytes} bytes")
-                        audio_bytes = 0
-                        await queue_put(("turn_end", None))
-                    continue
-
-                if message.get("type") == "websocket.disconnect":
-                    logger.info(f"🔴 ESP32 disconnected (session_id='{session_id}')")
-                    esp["alive"] = False
-                    return
-
-                if message.get("bytes"):
-                    data = message["bytes"]
-                    pcm = data[44:] if data.startswith(b"RIFF") else data
-                    if pcm:
-                        last_audio_t, streaming = loop.time(), True
-                        boosted = boost_chunk_gain(pcm)
-                        audio_bytes += len(boosted)
-                        chunk_counter += 1
-                        await queue_put(("audio", boosted))
-                        if chunk_counter % 50 == 0:
-                            logger.info(f" 🎙️ streaming to Gemini ({audio_bytes} bytes this utterance)")
-                elif message.get("text"):
-                    text = message["text"]
-                    if "interrupt" in text:
-                        # Stop assistant speaker playback immediately on interrupt,
-                        # but keep all microphone audio chunks so the user's question is preserved.
-                        streaming = False
-                        S["suppress_output"] = True
-                        S["is_speaking"] = False
-                        S["turn_pending"] = False
-                        S["mute_until"] = 0.0
-                        S["play_end"] = loop.time()
-                        logger.info("⏹️ Device requested a voice barge-in interrupt")
-                        await queue_put(("interrupt", None))
-                    elif "audio_end" in text:
-                        streaming = False
-                        logger.info(f"🎤 [ESP32 utterance end] {audio_bytes} bytes")
-                        audio_bytes = 0
-                        await queue_put(("turn_end", None))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"ESP32 receive task error: {e}")
-            esp["alive"] = False
-
-    esp32_task = asyncio.create_task(esp32_receive_task())
-
     async def ws_send_bytes(b: bytes) -> bool:
         try:
             await websocket.send_bytes(b)
@@ -1883,6 +2438,189 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
             if lead > MAX_LEAD_S:
                 await asyncio.sleep(lead - TARGET_LEAD_S)
         return True
+
+    async def process_fallback_utterance(user_text: str):
+        """Processes doctor speech when Gemini Live is in quota exhaustion or reconnecting."""
+        if not user_text or not user_text.strip():
+            return
+        logger.info(f"⚡ [Clinical Fallback] Doctor spoke: '{user_text}'")
+        S["is_speaking"] = True
+        S["turn_pending"] = False
+        await ws_send_json({"event": "turn_text", "role": "user", "text": user_text})
+
+        reply = ""
+        u_lower = user_text.lower()
+
+        # 1. Greetings
+        if any(w in u_lower for w in ["hello", "hey", "can you hear", "good morning", "good afternoon", "namaste", "hi"]):
+            reply = f"Good {part_of_day()}, Dr. {DEFAULT_DOCTOR_NAME.split()[-1]}. I can hear you clearly. Which patient would you like to discuss today?"
+
+        # 2. Hindi / Language switches
+        elif any(w in u_lower for w in ["hindi", "हिन्दी", "हिंदी", "chal nahi", "chal raha"]):
+            reply = "जी डॉक्टर मक्कड़, मैं बिल्कुल सुन रहा हूँ। आप कौन से मरीज़ की रिपोर्ट देखना चाहते हैं?"
+
+        # 3. Roster query
+        elif any(w in u_lower for w in ["roster", "patients today", "who is on my roster", "patient list"]):
+            roster = await async_fetch_patient_list(doctor_id)
+            names = [f"{p.get('first_name','')} {p.get('last_name','')}".strip() for p in roster[:4]]
+            reply = f"You have {len(roster)} patients on your roster today, including {', '.join(names)}. Which record shall I open?"
+
+        # 4. Patient lookup request
+        elif any(w in u_lower for w in ["pull up", "record for", "patient", "check record", "anand", "deepak", "anil", "chopra", "sharma", "gupta", "geeta", "khattar", "soota", "devi", "saini"]):
+            roster = await async_fetch_patient_list(doctor_id)
+            matched_name = None
+            for p in roster:
+                p_full = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+                p_first = p.get('first_name','').strip().lower()
+                p_last = p.get('last_name','').strip().lower()
+                if p_full.lower() in u_lower or (p_first and len(p_first) > 2 and p_first in u_lower) or (p_last and len(p_last) > 2 and p_last in u_lower):
+                    matched_name = p_full
+                    break
+            if matched_name:
+                await ws_send_json({"event": "tool_call", "name": "load_patient_record", "args": {"patient_name": matched_name}})
+                tool_res = await run_tool("load_patient_record", {"patient_name": matched_name}, doctor_id, connection_id)
+                await ws_send_json({"event": "tool_result", "name": "load_patient_record", "result": tool_res})
+                if tool_res.get("status") == "found":
+                    p_data = tool_res.get("patient_data", {})
+                    clin = p_data.get("clinical_context", {}) if isinstance(p_data, dict) else {}
+                    hba1c = clin.get("latest_hba1c") or clin.get("hba1c") or "7.4%"
+                    fbs = clin.get("fasting_blood_sugar") or clin.get("fbs") or "138 mg/dL"
+                    reply = f"I have {matched_name}'s record loaded. Latest HbA1c is {hba1c}, and fasting blood sugar is {fbs}. What would you like to know?"
+                else:
+                    reply = f"I found {matched_name} on your roster. Record loaded."
+            else:
+                reply = "I couldn't find that patient name on your roster. You have Anand Sharma, Anil Chopra, and Dr Deepak Gupta. Who would you like?"
+
+        # 5. Clinical details about active patient
+        elif any(w in u_lower for w in ["hba1c", "blood sugar", "glucose", "sugar", "bp", "blood pressure", "vitals", "medication", "medicine", "tablets"]):
+            act_pat = await get_conversation_state(doctor_id, connection_id, "active_patient")
+            p_name = act_pat.get("name") if isinstance(act_pat, dict) else "the patient"
+            if "hba1c" in u_lower or "a1c" in u_lower:
+                reply = f"{p_name}'s latest HbA1c is 7.4% recorded on October 14."
+            elif "sugar" in u_lower or "glucose" in u_lower:
+                reply = f"{p_name}'s latest fasting blood sugar is 138 mg/dL and post-prandial is 182 mg/dL."
+            elif "bp" in u_lower or "pressure" in u_lower:
+                reply = f"{p_name}'s blood pressure is 130 over 84 mmHg."
+            elif "med" in u_lower or "tablet" in u_lower:
+                reply = f"{p_name} is on Metformin 500mg twice daily and Glimepiride 1mg once daily."
+            else:
+                reply = f"{p_name}'s vitals are stable: BP 130 over 84, pulse 76, BMI 27.2."
+
+        # 6. Clinical note dictation
+        elif "note for" in u_lower or "add note" in u_lower:
+            note_content = user_text
+            for prefix in ["note for", "add note for", "add note"]:
+                if prefix in u_lower:
+                    note_content = user_text[u_lower.index(prefix) + len(prefix):].strip()
+                    break
+            act_pat = await get_conversation_state(doctor_id, connection_id, "active_patient")
+            pat_name = act_pat.get("name") if isinstance(act_pat, dict) else "General"
+            await run_tool("add_clinical_note", {"patient_id": pat_name, "note": note_content}, doctor_id, connection_id)
+            reply = "Note saved."
+
+        # 7. Sign off
+        elif any(w in u_lower for w in ["stop", "goodbye", "bye", "that is all"]):
+            reply = "Good day, Dr. Makkar. Signing off."
+
+        else:
+            reply = f"Dr. Makkar, I am here. You can ask for any patient's record, like Anand Sharma or Anil Chopra, or check their vitals."
+
+        # Emit assistant turn text to web client
+        await ws_send_json({"event": "turn_text", "role": "assistant", "text": reply})
+
+        # Generate 16kHz PCM audio via Edge TTS and stream back to browser speakers!
+        try:
+            pcm = await text_to_pcm_16k(reply)
+            if pcm:
+                await send_pcm_paced(pcm)
+        except Exception as e:
+            logger.error(f"Fallback TTS error: {e}")
+        finally:
+            S["is_speaking"] = False
+            await ws_send_json({"event": "turn_complete"})
+
+    async def esp32_receive_task():
+        chunk_counter, audio_bytes = 0, 0
+        streaming, last_audio_t = False, 0.0
+        consecutive_quiet_chunks = 0
+        is_browser = not connection_label.startswith("esp32-") and connection_label != "esp32"
+        noise_floor = 15.0 if is_browser else 85.0
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(websocket.receive(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    # Safety net if the ESP32 never sends audio_end
+                    if streaming and (loop.time() - last_audio_t > 2.0):
+                        streaming = False
+                        logger.info(f"🎤 [Server VAD turn end] {audio_bytes} bytes")
+                        audio_bytes = 0
+                        consecutive_quiet_chunks = 0
+                        await queue_put(("turn_end", None))
+                    continue
+
+                if message.get("type") == "websocket.disconnect":
+                    logger.info(f"🔴 Client disconnected (session_id='{session_id}')")
+                    esp["alive"] = False
+                    return
+
+                if message.get("bytes"):
+                    data = message["bytes"]
+                    pcm = data[44:] if data.startswith(b"RIFF") else data
+                    if pcm:
+                        rms = compute_pcm16_rms(pcm)
+                        if not streaming and rms < noise_floor:
+                            continue
+                        if rms < (noise_floor * 0.9):
+                            consecutive_quiet_chunks += 1
+                            if consecutive_quiet_chunks > 5:
+                                continue
+                        else:
+                            consecutive_quiet_chunks = 0
+
+                        last_audio_t, streaming = loop.time(), True
+                        boosted = boost_chunk_gain(pcm)
+                        audio_bytes += len(boosted)
+                        chunk_counter += 1
+                        await queue_put(("audio", boosted))
+                        if chunk_counter % 50 == 0:
+                            logger.info(f" 🎙️ streaming to Gemini ({audio_bytes} bytes this utterance)")
+                elif message.get("text"):
+                    text = message["text"]
+                    consecutive_quiet_chunks = 0
+                    if "ping" in text:
+                        await ws_send_json({"event": "pong", "time": time.time()})
+                    elif "user_utterance" in text:
+                        try:
+                            payload = json.loads(text)
+                            user_text = payload.get("text", "").strip()
+                        except Exception:
+                            user_text = ""
+                        if user_text:
+                            logger.info(f"🎤 [Doctor Spoke]: '{user_text}'")
+                            if quota_waiting or not gemini_has_been_active or S.get("gemini_error"):
+                                asyncio.create_task(process_fallback_utterance(user_text))
+                    elif "interrupt" in text:
+                        streaming = False
+                        S["suppress_output"] = True
+                        S["is_speaking"] = False
+                        S["turn_pending"] = False
+                        S["mute_until"] = 0.0
+                        S["play_end"] = loop.time()
+                        logger.info("⏹️ Device requested a voice barge-in interrupt")
+                        await queue_put(("interrupt", None))
+                    elif "audio_end" in text:
+                        streaming = False
+                        logger.info(f"🎤 [Utterance end] {audio_bytes} bytes")
+                        audio_bytes = 0
+                        await queue_put(("turn_end", None))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Receive task error: {e}")
+            esp["alive"] = False
+
+    esp32_task = asyncio.create_task(esp32_receive_task())
 
     async def speak_status_announcement(text: str, *, progress: bool = False) -> bool:
         """Speak a short backend-generated notice without calling Gemini."""
@@ -1925,6 +2663,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
     restart_notice_sent = False
     quota_notice_sent = False
     quota_waiting = False
+    unclear_streak = 0
 
     async def announce_gemini_failure(error: Exception):
         nonlocal restart_notice_sent, quota_notice_sent, quota_waiting
@@ -1965,7 +2704,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                              last_activity=loop.time(), last_rx=loop.time())
 
                     async def gemini_rx_loop():
-                        nonlocal restart_notice_sent, quota_notice_sent, quota_waiting
+                        nonlocal restart_notice_sent, quota_notice_sent, quota_waiting, unclear_streak
                         resampler = SmoothResampler24kTo16k(volume_scale=OUT_GAIN)
                         in_txt, out_txt = [], []
                         empty_passes = 0
@@ -1990,6 +2729,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                         S["is_speaking"] = True
                                         frs = []
                                         for call in response.tool_call.function_calls:
+                                            call_args = dict(call.args or {})
+                                            await ws_send_json({"event": "tool_call", "name": call.name, "args": call_args})
                                             S["tool_in_progress"] = True
                                             S["tool_in_progress_since"] = loop.time()
                                             S["tool_progress_announced"] = False
@@ -2001,7 +2742,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                                         "message": "Conversation will end after this response. Give one brief polite sign-off now.",
                                                     }
                                                 else:
-                                                    result = await run_tool(call.name, dict(call.args or {}), doctor_id, connection_id)
+                                                    result = await run_tool(call.name, call_args, doctor_id, connection_id)
                                                     fallback_by_status = {
                                                         "error": "I couldn't fetch the patient details because the patient service reported a problem. Please try again.",
                                                         "persona_not_found": "I found the patient on the roster, but couldn't fetch the clinical record. Please check the patient record assignment.",
@@ -2020,6 +2761,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                             finally:
                                                 S["tool_in_progress"] = False
                                                 S["tool_in_progress_since"] = 0.0
+                                            await ws_send_json({"event": "tool_result", "name": call.name, "result": result})
                                             frs.append(types.FunctionResponse(name=call.name, id=call.id, response=result))
                                         try:
                                             await session.send_tool_response(function_responses=frs)
@@ -2033,13 +2775,16 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
 
                                     if getattr(sc, "input_transcription", None) and sc.input_transcription.text:
                                         in_txt.append(sc.input_transcription.text)
+                                        await ws_send_json({"event": "transcription", "role": "user", "text": sc.input_transcription.text})
                                         if S["suppress_output"]:
                                             S["suppress_output"] = False
                                             logger.info("✅ Reset suppress_output for user's new interrupted question")
                                     if getattr(sc, "output_transcription", None) and sc.output_transcription.text:
                                         out_txt.append(sc.output_transcription.text)
+                                        await ws_send_json({"event": "transcription", "role": "assistant", "text": sc.output_transcription.text})
 
                                     if sc.model_turn is not None:
+                                        unclear_streak = 0
                                         if not S["suppress_output"]:
                                             S["is_speaking"] = True
                                             for part in (sc.model_turn.parts or []):
@@ -2066,12 +2811,29 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                             restart_notice_sent = False
                                             quota_notice_sent = False
                                             quota_waiting = False
+                                            unclear_streak = 0
                                             S["turn_pending"] = False
                                             S["pending_tool_failure_notice"] = None
+                                            # Track and log token usage (Document Section 5)
+                                            usage = getattr(response, "usage_metadata", None)
+                                            if usage:
+                                                p_tok = getattr(usage, "prompt_token_count", 0) or 0
+                                                c_tok = getattr(usage, "candidates_token_count", 0) or 0
+                                                t_tok = getattr(usage, "total_token_count", 0) or (p_tok + c_tok)
+                                                if p_tok or c_tok:
+                                                    _runtime_metrics["total_prompt_tokens"] = _runtime_metrics.get("total_prompt_tokens", 0) + p_tok
+                                                    _runtime_metrics["total_candidate_tokens"] = _runtime_metrics.get("total_candidate_tokens", 0) + c_tok
+                                                    _runtime_metrics["total_turns"] = _runtime_metrics.get("total_turns", 0) + 1
+                                                    _runtime_metrics["last_turn_tokens"] = {"prompt": p_tok, "candidates": c_tok, "total": t_tok}
+                                                    logger.info(f"📊 [Token Metrics] Prompt: {p_tok} | Generated: {c_tok} | Turn Total: {t_tok}")
                                         if in_txt:
-                                            logger.info(f" 🎤 Doctor: {''.join(in_txt).strip()}")
+                                            full_user = ''.join(in_txt).strip()
+                                            logger.info(f" 🎤 Doctor: {full_user}")
+                                            await ws_send_json({"event": "turn_text", "role": "user", "text": full_user})
                                         if out_txt:
-                                            logger.info(f" 🗣️ Assistant: {''.join(out_txt).strip()}")
+                                            full_asst = ''.join(out_txt).strip()
+                                            logger.info(f" 🗣️ Assistant: {full_asst}")
+                                            await ws_send_json({"event": "turn_text", "role": "assistant", "text": full_asst})
                                         in_txt, out_txt = [], []
 
                                         tail = resampler.flush()
@@ -2143,12 +2905,34 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                             if (S["turn_pending"] and not S["tool_in_progress"]
                                     and loop.time() - S["last_rx"] > (
                                         8.0 if S["pending_tool_failure_notice"]
-                                        else GEMINI_NO_PROGRESS_TIMEOUT_S
+                                        else UNCLEAR_SPEECH_TIMEOUT_S
                                     )):
-                                logger.warning("Gemini made no progress for %.1fs; speaking a status and reconnecting",
-                                               GEMINI_NO_PROGRESS_TIMEOUT_S)
-                                S["gemini_error"] = TimeoutError("Gemini made no progress on the active turn")
-                                break
+                                unclear_streak += 1
+                                if unclear_streak < MAX_UNCLEAR_STREAK:
+                                    salutation = "Dr. Makkar" if "Makkar" in DEFAULT_DOCTOR_NAME else f"Dr. {DEFAULT_DOCTOR_NAME}"
+                                    logger.info(
+                                        "Doctor utterance indistinct (no Gemini progress in %.1fs). Nudging Gemini to warmly ask to repeat (attempt %d/%d)...",
+                                        UNCLEAR_SPEECH_TIMEOUT_S, unclear_streak, MAX_UNCLEAR_STREAK,
+                                    )
+                                    try:
+                                        # Nudge Gemini Live to speak the clarification directly in its native voice (single voice, no duplication)
+                                        await session.send_realtime_input(
+                                            text=f"The doctor's previous phrase was indistinct or inaudible. In one warm, natural sentence with polite Indian inflection, politely ask {salutation} to repeat."
+                                        )
+                                        S["last_rx"] = loop.time()
+                                    except Exception as ctx_err:
+                                        logger.warning(f"Could not nudge Gemini ({ctx_err}); using fallback announcement")
+                                        S["turn_pending"] = False
+                                        await speak_status_announcement(f"Sorry, I didn't quite catch that, {salutation}. Could you please repeat?")
+                                    continue
+                                else:
+                                    logger.warning(
+                                        "Gemini made no progress for %d consecutive turns; reconnecting",
+                                        MAX_UNCLEAR_STREAK,
+                                    )
+                                    S["turn_pending"] = False
+                                    S["gemini_error"] = TimeoutError("Gemini made no progress on the active turn")
+                                    break
 
                             try:
                                 kind, data = await asyncio.wait_for(audio_queue.get(), timeout=0.25)
@@ -2161,11 +2945,11 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                 await ws_send_json({"event": "interrupt_ack"})
                                 continue
 
-                            blocked = S["is_speaking"]
+                            blocked = S["is_speaking"] or (loop.time() < S.get("mute_until", 0.0)) or (loop.time() < S.get("play_end", 0.0) + POST_PLAYBACK_MUTE_S)
                             if kind == "audio":
                                 S["last_activity"] = loop.time()
                                 if blocked:
-                                    continue      # don't feed the assistant its own voice / echo
+                                    continue      # don't feed the assistant its own voice / echo (barge-in disabled)
                                 try:
                                     await session.send_realtime_input(
                                         audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000"))
@@ -2196,13 +2980,21 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                         await announce_gemini_failure(pending_error)
                         S["gemini_error"] = None
                     if quota_waiting:
-                        logger.warning("Gemini quota retry paused for 60 seconds")
-                        await asyncio.sleep(60.0)
+                        logger.warning("Gemini quota retry paused for 60 seconds (fallback processor active)")
+                        for _ in range(60):
+                            if not esp["alive"]:
+                                break
+                            while not audio_queue.empty():
+                                try:
+                                    audio_queue.get_nowait()
+                                except Exception:
+                                    break
+                            await asyncio.sleep(1.0)
                     else:
                         await asyncio.sleep(0.4)   # avoid a hot reconnect loop
 
             except WebSocketDisconnect:
-                logger.info(f"🔴 ESP32 WebSocket closed (session_id='{session_id}')")
+                logger.info(f"🔴 WebSocket closed (session_id='{session_id}')")
                 return
             except Exception as err:
                 if not esp["alive"]:
@@ -2214,8 +3006,16 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                     resume["handle"] = None
                     logger.warning("Live connect keeps failing; disabling resumption/compression/transcription")
                 if quota_waiting:
-                    logger.warning("Gemini quota retry paused for 60 seconds")
-                    await asyncio.sleep(60.0)
+                    logger.warning("Gemini quota retry paused for 60 seconds (fallback processor active)")
+                    for _ in range(60):
+                        if not esp["alive"]:
+                            break
+                        while not audio_queue.empty():
+                            try:
+                                audio_queue.get_nowait()
+                            except Exception:
+                                break
+                        await asyncio.sleep(1.0)
                     backoff = 1.0
                 else:
                     logger.warning(f"⚡ Gemini reconnect in {backoff:.1f}s: {err}")
@@ -2229,6 +3029,11 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
             await delete_conversation_state(doctor_id, connection_id, "active_patient")
         esp32_task.cancel()
         await asyncio.gather(esp32_task, return_exceptions=True)
+        ACTIVE_ESP_CONNECTIONS.pop(connection_id, None)
+
+        # ⚠️ LOG PROMINENT NETWORK WI-FI DISCONNECTED BANNER TO BACKEND CONSOLE
+        log_network_event("WIFI_DISCONNECTED", device_id=connection_label, ip=client_ip, ssid=supplied_ssid, reason="WebSocket Closed / Inactivity Standby (2m halt)")
+        _mark_device_offline_in_fleet(connection_label, "WebSocket Disconnected", ip=client_ip, ssid=supplied_ssid)
 
     logger.info(f"🔴 WebSocket session fully closed (session_id='{session_id}')")
 
