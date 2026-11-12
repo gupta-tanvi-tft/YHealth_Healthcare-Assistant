@@ -1,4 +1,5 @@
 #include "rgb_led_driver.h"
+#include "led_config.h"
 #include "esp_log.h"
 #include "bsp_board.h"
 #include "freertos/FreeRTOS.h"
@@ -90,11 +91,11 @@ void rgb_led_set_vu_meter(int level)
         for (int i = 0; i < LED_STRIP_LED_COUNT; i++) {
             if (i < level) {
                 if (i < 4) {
-                    led_strip_set_pixel(s_led_strip, i, 0, 180, 0);
+                    led_strip_set_pixel(s_led_strip, i, HEX_R(LED_COLOR_VU_LOW), HEX_G(LED_COLOR_VU_LOW), HEX_B(LED_COLOR_VU_LOW));
                 } else if (i < 6) {
-                    led_strip_set_pixel(s_led_strip, i, 180, 180, 0);
+                    led_strip_set_pixel(s_led_strip, i, HEX_R(LED_COLOR_VU_MID), HEX_G(LED_COLOR_VU_MID), HEX_B(LED_COLOR_VU_MID));
                 } else {
-                    led_strip_set_pixel(s_led_strip, i, 220, 0, 0);
+                    led_strip_set_pixel(s_led_strip, i, HEX_R(LED_COLOR_VU_HIGH), HEX_G(LED_COLOR_VU_HIGH), HEX_B(LED_COLOR_VU_HIGH));
                 }
             } else {
                 led_strip_set_pixel(s_led_strip, i, 0, 0, 0);

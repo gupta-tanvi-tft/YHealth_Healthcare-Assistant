@@ -207,41 +207,12 @@ static void request_interruption(const char *reason) {
 }
 
 // ==========================================================
-// 🎨 LED COLOR CONFIG — PASTE HEX CODES HERE & REFLASH
+// 🎨 MASTER LED CONFIGURATION
 // ==========================================================
-// Format: 0xRRGGBB  (same as CSS/HTML color codes, just replace # with 0x)
-//
-// STATE               │ COLOR NAME        │ HEX CODE     │ ANIMATION
-// ────────────────────┼───────────────────┼──────────────┼─────────────
-// Sleep / Standby     │ Parrot Green      │ 0x32F014     │ Slow breathing
-// WS Disconnected     │ Parrot Green      │ 0x37F519     │ Fast blink
-// Listening           │ Soft Pink         │ 0xF573A5     │ Pulsing
-// Thinking            │ Pastel Green      │ 0x5AE182     │ Pulsing
-// Speaking            │ Teal Blue         │ 0x0FD2E6     │ Wave
-
-#define LED_COLOR_SLEEP         0x32F014   // Parrot Green  — sleeping / waiting for wake word
-#define LED_COLOR_STANDBY       0x32F014   // Parrot Green  — standby, waiting for voice
-#define LED_COLOR_DISCONNECTED  0x37F519   // Parrot Green  — WebSocket reconnecting
-#define LED_COLOR_LISTENING     0xF573A5   // Soft Pink     — mic active, capturing voice
-#define LED_COLOR_THINKING      0x5AE182   // Pastel Green  — processing query
-#define LED_COLOR_SPEAKING      0x0FD2E6   // Teal Blue     — playing response audio
-
-// Breathing / pulse speeds (lower = slower, higher = faster)
-#define LED_ANIM_SLEEP_SPEED     0.08f   // very slow calm breathing
-#define LED_ANIM_STANDBY_SPEED   0.10f   // calm standby pulse
-#define LED_ANIM_DISCONN_SPEED   0.20f   // faster blink = needs attention
-#define LED_ANIM_LISTEN_SPEED    0.25f   // medium pulse while listening
-#define LED_ANIM_THINK_SPEED     0.30f   // slightly faster = working
-#define LED_ANIM_SPEAK_SPEED     0.35f   // wave animation speed
-
-// Brightness range: min..max (0.0 to 1.0)
-#define LED_BRIGHTNESS_MIN       0.35f   // dimmest point of breathing cycle
-#define LED_BRIGHTNESS_MAX       1.00f   // brightest point of breathing cycle
-
-// Helper macros — extract R, G, B from 0xRRGGBB
-#define HEX_R(c) (uint8_t)(((c) >> 16) & 0xFF)
-#define HEX_G(c) (uint8_t)(((c) >>  8) & 0xFF)
-#define HEX_B(c) (uint8_t)(((c)      ) & 0xFF)
+// ALL LED colors, speeds, and brightness are in "led_config.h".
+// Open that single file to change ANY color hex code.
+// ==========================================================
+#include "led_config.h"
 
 // ==========================================================
 // LED ANIMATION (3 centre LEDs: 2, 3, 4) — runs on Core 0 @ 20 fps
@@ -466,7 +437,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
     s_has_odd_byte = false;
     ESP_LOGI(TAG, "⚡ Persistent WebSocket connected to relay server");
     if (!s_boot_anim_done) // never fight the LED task once it is running
-      rgb_led_set_all(255, 255, 255);
+      rgb_led_set_all_hex(LED_COLOR_RELAY_CONNECTED);
     // Attempt to send any pending interrupt now that the socket is up
     maybe_send_pending_interrupt();
     break;
@@ -1126,7 +1097,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(nvs_ret);
 
   rgb_led_init();
-  rgb_led_set_all(0, 200, 255); // Sky Blue: booting
+  rgb_led_set_all_hex(LED_COLOR_BOOTING);
   vTaskDelay(pdMS_TO_TICKS(300));
 
   s_playback_ctx.play_dev = esp_ret_play_dev();
@@ -1143,14 +1114,14 @@ void app_main(void) {
   s_ws_connect_mutex = xSemaphoreCreateMutex();
   if (!s_ws_connect_mutex) {
     ESP_LOGE(TAG, "Failed to create WebSocket reconnect mutex!");
-    rgb_led_set_all(255, 0, 0);
+    rgb_led_set_all_hex(LED_COLOR_ERROR);
     return;
   }
 
   s_audio_play_rb = xRingbufferCreate(PLAYBACK_RB_SIZE, RINGBUF_TYPE_BYTEBUF);
   if (!s_audio_play_rb) {
     ESP_LOGE(TAG, "Failed to create playback ring buffer!");
-    rgb_led_set_all(255, 0, 0);
+    rgb_led_set_all_hex(LED_COLOR_ERROR);
     return;
   }
   xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 6144, NULL,
@@ -1163,18 +1134,18 @@ void app_main(void) {
   ESP_LOGI(TAG, "Connecting to Wi-Fi...");
   if (wifi_init_sta() != ESP_OK) {
     ESP_LOGE(TAG, "Wi-Fi connection failed! Check SSID & password.");
-    rgb_led_set_all(255, 0, 0);
+    rgb_led_set_all_hex(LED_COLOR_ERROR);
     return;
   }
-  rgb_led_set_all(0, 255, 0); // Green: Wi-Fi OK
+  rgb_led_set_all_hex(LED_COLOR_WIFI_OK);
   vTaskDelay(pdMS_TO_TICKS(400));
 
   ESP_LOGI(TAG, "Opening persistent WebSocket at boot...");
   ensure_websocket_connected(&s_playback_ctx);
   if (ws_ready())
-    rgb_led_set_all(255, 255, 255); // White: relay connected
+    rgb_led_set_all_hex(LED_COLOR_RELAY_CONNECTED);
   else
-    rgb_led_set_all(255, 100, 0); // Amber: device is up, relay is unavailable
+    rgb_led_set_all_hex(LED_COLOR_RELAY_UNAVAILABLE);
   vTaskDelay(pdMS_TO_TICKS(400));
 
   xTaskCreatePinnedToCore(led_animation_task, "led_anim_task", 4096, NULL, 3,
