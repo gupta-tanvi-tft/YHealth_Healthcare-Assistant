@@ -209,11 +209,11 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // DETECTOR A: "LIRA" ("LEE" -> "RAH")
     // -------------------------------------------------------------
     // Stage 1: "LEE" (/liː/) -> High formant dominance (concentrated ~2600Hz)
-    if (det_high > 160.0f &&
-        det_high > 1.30f * det_mid &&
-        det_high > 1.25f * det_low) {
+    if (det_high > 110.0f &&
+        det_high > 1.20f * det_mid &&
+        det_high > 1.15f * det_low) {
         s_lira.s1_consecutive++;
-        if (s_lira.s1_consecutive >= 3) {
+        if (s_lira.s1_consecutive >= 2) {
             s_lira.s1_confirmed = true;
             s_lira.last_s1_ms = now;
         }
@@ -224,10 +224,10 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // Stage 2: "RAH" (/rɑː/) -> Low formant dominance (concentrated ~700Hz)
     if (s_lira.s1_confirmed) {
         int64_t delta = now - s_lira.last_s1_ms;
-        if (delta >= 120 && delta <= 800) {
-            if (det_low > 170.0f && det_low > 1.30f * det_high) {
+        if (delta >= 100 && delta <= 900) {
+            if (det_low > 110.0f && det_low > 1.20f * det_high) {
                 s_lira.s2_consecutive++;
-                if (s_lira.s2_consecutive >= 3) {
+                if (s_lira.s2_consecutive >= 2) {
                     out_result->detected = true;
                     out_result->confidence = 0.95f;
                     out_result->keyword = "LIRA";
@@ -238,21 +238,21 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
             } else {
                 s_lira.s2_consecutive = 0;
             }
-        } else if (delta > 800) {
+        } else if (delta > 900) {
             s_lira.s1_confirmed = false;
             s_lira.s2_consecutive = 0;
         }
     }
 
     // -------------------------------------------------------------
-    // DETECTOR B: "HELLO ASSISTANT" ("HELLO" -> "ASSISTANT")
+    // DETECTOR B: "HELLO ASSISTANT" ("HELLO" / "HEY" -> "ASSISTANT")
     // -------------------------------------------------------------
-    // Stage 1: "HELLO" -> Mid/Low vowel formant concentration
-    if ((det_mid + det_low) > 190.0f &&
-        (det_mid + det_low) > 1.35f * det_high &&
-        raw_rms > 110.0f) {
+    // Stage 1: "HELLO" / "HEY" -> Mid/Low vowel formant concentration
+    if ((det_mid + det_low) > 130.0f &&
+        (det_mid + det_low) > 1.20f * det_high &&
+        raw_rms > 70.0f) {
         s_ha.hello_consecutive++;
-        if (s_ha.hello_consecutive >= 3) {
+        if (s_ha.hello_consecutive >= 2) {
             s_ha.hello_confirmed = true;
             s_ha.last_hello_ms = now;
         }
@@ -263,10 +263,10 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // Stage 2: "ASSISTANT" -> Sibilant "SIS" burst (high frequency)
     if (s_ha.hello_confirmed) {
         int64_t delta_ha = now - s_ha.last_hello_ms;
-        if (delta_ha >= 150 && delta_ha <= 1100) {
-            if (det_high > 160.0f && (det_high > 1.25f * det_low && det_high > 1.25f * det_mid)) {
+        if (delta_ha >= 120 && delta_ha <= 1200) {
+            if (det_high > 110.0f && (det_high > 1.15f * det_low && det_high > 1.15f * det_mid)) {
                 s_ha.sis_consecutive++;
-                if (s_ha.sis_consecutive >= 3) {
+                if (s_ha.sis_consecutive >= 2) {
                     out_result->detected = true;
                     out_result->confidence = 0.95f;
                     out_result->keyword = "HELLO ASSISTANT";
@@ -277,7 +277,7 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
             } else {
                 s_ha.sis_consecutive = 0;
             }
-        } else if (delta_ha > 1100) {
+        } else if (delta_ha > 1200) {
             s_ha.hello_confirmed = false;
             s_ha.sis_consecutive = 0;
         }

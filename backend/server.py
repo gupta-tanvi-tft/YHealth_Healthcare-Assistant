@@ -1055,7 +1055,7 @@ def build_doctor_agent_prompt(
         "- TODAY'S SCHEDULE: When asked about appointments, summarize from TODAY'S SCHEDULE in 1-2 sentences. Call get_doctor_consultations for date queries.\n"
         "- CLINICAL NOTES: Repeat note back once for confirmation, call add_clinical_note, then say: 'Note saved.'\n"
         "- ALERTS: Confirm alert type, call escalate_alert, then say: 'Alert sent.'\n"
-        "- SIGN-OFF: On standalone sign-off ('stop', 'bye', 'goodbye', 'go to sleep'), call end_conversation, give one brief sign-off and stop.\n\n"
+        "- SIGN-OFF: When the user says goodbye or wants to conclude/end the session (e.g. 'goodbye', 'bye', 'see you', 'see you later', 'stop', 'go to sleep', 'thank you bye'), call end_conversation immediately, give one brief warm sign-off (e.g. 'Goodbye Doctor, have a great day!') and stop.\n\n"
         "DOCTOR CONTEXT & REAL-TIME CLOCK:\n"
         f"Name: Dr. {doctor_name}\n"
         f"Specialization: {specialization}\n"
@@ -2215,7 +2215,7 @@ def build_live_tools(types):
            "Get current live Indian Standard Time (IST), date, and day of week.",
            {}, []),
         fd("end_conversation",
-           "End conversation on standalone sign-off command (stop, goodbye, bye, go to sleep).",
+           "End conversation on sign-off command (goodbye, bye, see you, stop, go to sleep).",
            {}, []),
     ])]
 

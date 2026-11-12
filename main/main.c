@@ -15,6 +15,7 @@
 #include "rgb_led_driver.h"
 #include "wakeword_engine.h"
 #include "wifi_connect.h"
+#include "esp_wifi.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -306,23 +307,23 @@ static void finish_playback(void) {
   s_status_only_after_playback = false;
   bool end_conversation = s_end_conversation_after_playback;
   s_end_conversation_after_playback = false;
+  if (end_conversation) {
+    enter_sleep_mode("doctor goodbye sign-off");
+    ESP_LOGI(TAG, "🗣️ Doctor goodbye finished. Disconnected WebSocket and "
+                  "entered SLEEP mode.");
+    return;
+  }
   if (s_conv_state == CONV_STATE_SPEAKING) {
-    if (end_conversation) {
-      enter_sleep_mode("doctor goodbye sign-off");
-      ESP_LOGI(TAG, "🗣️ Doctor goodbye finished. Disconnected WebSocket and "
-                    "entered SLEEP mode (RED light).");
-    } else {
-      s_conv_state = status_only ? CONV_STATE_THINKING : CONV_STATE_LISTENING;
-      s_last_speech_time_ms = now_ms();
-      update_led_state(s_conv_state);
-      if (status_only)
-        ESP_LOGI(TAG,
-                 "ℹ️ Status update finished. Still waiting for the result.");
-      else
-        ESP_LOGI(
-            TAG,
-            "🗣️ Assistant finished speaking. Ready for the next question.");
-    }
+    s_conv_state = status_only ? CONV_STATE_THINKING : CONV_STATE_LISTENING;
+    s_last_speech_time_ms = now_ms();
+    update_led_state(s_conv_state);
+    if (status_only)
+      ESP_LOGI(TAG,
+               "ℹ️ Status update finished. Still waiting for the result.");
+    else
+      ESP_LOGI(
+          TAG,
+          "🗣️ Assistant finished speaking. Ready for the next question.");
   }
 }
 
@@ -677,6 +678,44 @@ static void websocket_maintenance_task(void *pvParameters) {
 }
 
 // ==========================================================
+// REAL-TIME HEARTBEAT & SERVER PING TASK (Core 0)
+// ==========================================================
+// Best Practice: 15-second heartbeat cadence for hospital & clinic smart speakers.
+// Continuously verifies Wi-Fi connectivity, reports RSSI, free heap, and
+// ensures the speaker remains visible to the fleet server over LAN / Internet.
+#define HEARTBEAT_CADENCE_MS 15000
+
+static void heartbeat_task(void *pvParameters) {
+  ESP_LOGI(TAG, "💓 [HEARTBEAT] Task initialized. Cadence: 15s (Best Practice).");
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_CADENCE_MS));
+
+    wifi_ap_record_t ap_info = {0};
+    esp_err_t wifi_err = esp_wifi_sta_get_ap_info(&ap_info);
+
+    if (wifi_err == ESP_OK) {
+      uint32_t free_heap = (uint32_t)esp_get_free_heap_size();
+      bool ws_ok = ws_ready();
+
+      ESP_LOGI(TAG, "💓 [HEARTBEAT] Wi-Fi Link: ACTIVE | SSID: '%s' | RSSI: %d dBm | Free Heap: %lu B | Server Visibility: %s",
+               (char *)ap_info.ssid, ap_info.rssi, (unsigned long)free_heap,
+               ws_ok ? "ONLINE (Active Audio Link)" : "STANDBY (Reachable over LAN/WAN)");
+
+      // If persistent WebSocket is ready, dispatch periodic heartbeat telemetry frame
+      if (ws_ok && s_persistent_ws_client) {
+        char hb_payload[128];
+        snprintf(hb_payload, sizeof(hb_payload),
+                 "{\"event\":\"heartbeat\",\"device_id\":\"%s\",\"rssi\":%d,\"heap\":%lu}",
+                 s_device_id, ap_info.rssi, (unsigned long)free_heap);
+        esp_websocket_client_send_text(s_persistent_ws_client, hb_payload, strlen(hb_payload), pdMS_TO_TICKS(100));
+      }
+    } else {
+      ESP_LOGW(TAG, "⚠️ [HEARTBEAT] Wi-Fi Link: DISCONNECTED | Retrying AP connection...");
+    }
+  }
+}
+
+// ==========================================================
 // MIC STREAMING TASK (Core 1)
 // ==========================================================
 static void continuous_mic_stream_task(void *pvParameters) {
@@ -744,14 +783,15 @@ static void continuous_mic_stream_task(void *pvParameters) {
       continue;
     }
 
-    // 1. SLEEP MODE: WebSocket is disconnected, red light is on.
-    // Listen for local wakeword ("hello assistant" or "LIRA") or confirmed voice activation
+    // 1. SLEEP MODE: WebSocket is disconnected.
+    // Listen exclusively for local wakeword ("Hello Assistant" or "LIRA").
+    // Ambient noise or general room speech does NOT trigger a wake-up.
     if (s_conv_state == CONV_STATE_SLEEP || s_ws_sleep) {
       wakeword_result_t ww_res;
       bool ww_hit = wakeword_feed_samples(chunk_mono, chunk_samples, &ww_res);
-      if (ww_hit || (rms >= VAD_WAKE_THRESHOLD_RMS && ++wake_hits >= WAKE_CONFIRM_CHUNKS)) {
-        const char *trigger_name = ww_hit ? ww_res.keyword : "Wake Word (Voice)";
-        ESP_LOGI(TAG, "🎯 Wakeword detected in SLEEP: '%s'! Waking up instantly...",
+      if (ww_hit) {
+        const char *trigger_name = ww_res.keyword;
+        ESP_LOGI(TAG, "🎯 Wakeword detected in SLEEP: '%s'! Waking up and connecting WebSocket...",
                  trigger_name);
         exit_sleep_mode(trigger_name);
         if (ws_ready()) {
@@ -762,6 +802,8 @@ static void continuous_mic_stream_task(void *pvParameters) {
         speech_accum_ms = chunk_duration_ms * 2;
         silence_accum_ms = 0;
         pre_chunks = wake_hits = 0;
+      } else {
+        wake_hits = 0;
       }
       continue;
     }
@@ -1105,6 +1147,9 @@ void app_main(void) {
 
   xTaskCreatePinnedToCore(websocket_maintenance_task, "ws_maintenance_task",
                           4096, NULL, 4, NULL, 0);
+
+  xTaskCreatePinnedToCore(heartbeat_task, "heartbeat_task", 4096, NULL, 3,
+                          NULL, 0);
 
   xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 6144,
                           NULL, 9, NULL, 1);
