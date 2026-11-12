@@ -1,5 +1,6 @@
-# ESP32-S3 Gemini Voice Assistant
+# Desk Assistant in Healthcare Industry
 
+A combination of IoT, AI, Audio engineering, Agentic AI, Full Stack engineering!
 This project connects a Waveshare ESP32-S3-AUDIO board to a Python FastAPI relay, Gemini Live, and the patient roster/persona APIs. The firmware captures and plays audio; the backend handles Gemini sessions, patient matching, API calls, Redis caching, and WebSocket audio transport.
 
 ## Features
