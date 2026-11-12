@@ -195,7 +195,7 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // DETECTOR A: "LIRA" ("LEE" -> "RAH")
     // -------------------------------------------------------------
     // Stage 1: "LEE" (/liː/) -> High formant dominance (~2600Hz)
-    if (det_high >= 14.0f && det_high > 0.85f * det_low) {
+    if (det_high >= 18.0f && det_high > 1.20f * det_low && raw_rms >= 35.0f) {
         s_lira.s1_confirmed = true;
         s_lira.last_s1_ms = now;
     }
@@ -203,8 +203,8 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // Stage 2: "RAH" (/rɑː/) -> Low formant dominance (~700Hz)
     if (s_lira.s1_confirmed) {
         int64_t delta = now - s_lira.last_s1_ms;
-        if (delta >= 70 && delta <= 950) {
-            if (det_low >= 14.0f && det_low > 0.85f * det_high) {
+        if (delta >= 80 && delta <= 950) {
+            if (det_low >= 18.0f && det_low > 1.20f * det_high) {
                 out_result->detected = true;
                 out_result->confidence = 0.95f;
                 out_result->keyword = "LIRA";
@@ -221,7 +221,7 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // DETECTOR B: "HELLO ASSISTANT" ("HELLO" / "HEY" -> "ASSISTANT")
     // -------------------------------------------------------------
     // Stage 1: "HELLO" / "HEY" -> Mid/Low vowel formant concentration
-    if ((det_mid + det_low) >= 18.0f && raw_rms >= 30.0f) {
+    if ((det_mid + det_low) >= 24.0f && (det_mid + det_low) > 1.25f * det_high && raw_rms >= 40.0f) {
         s_ha.hello_confirmed = true;
         s_ha.last_hello_ms = now;
     }
@@ -229,8 +229,8 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // Stage 2: "ASSISTANT" -> Sibilant "SIS" burst (high frequency)
     if (s_ha.hello_confirmed) {
         int64_t delta_ha = now - s_ha.last_hello_ms;
-        if (delta_ha >= 90 && delta_ha <= 1250) {
-            if (det_high >= 15.0f) {
+        if (delta_ha >= 100 && delta_ha <= 1250) {
+            if (det_high >= 20.0f && det_high > 1.15f * det_mid) {
                 out_result->detected = true;
                 out_result->confidence = 0.95f;
                 out_result->keyword = "HELLO ASSISTANT";

@@ -792,14 +792,14 @@ static void continuous_mic_stream_task(void *pvParameters) {
     }
 
     // 1. SLEEP MODE: WebSocket is disconnected.
-    // Listen for local wakeword ("Hello Assistant" or "LIRA") or intentional direct voice.
+    // Listen EXCLUSIVELY for local wakeword ("Hello Assistant" or "LIRA").
+    // Ambient room noise, coughing, or random speech will NEVER wake up the device.
     if (s_conv_state == CONV_STATE_SLEEP || s_ws_sleep) {
       wakeword_result_t ww_res;
       bool ww_hit = wakeword_feed_samples(chunk_mono, chunk_samples, &ww_res);
-      bool voice_wake = (rms >= 75.0f && ++wake_hits >= 2);
-      if (ww_hit || voice_wake) {
-        const char *trigger_name = ww_hit ? ww_res.keyword : "VOICE ACTIVATION";
-        ESP_LOGI(TAG, "🎯 Wake trigger in SLEEP: '%s'! Waking up instantly...",
+      if (ww_hit) {
+        const char *trigger_name = ww_res.keyword;
+        ESP_LOGI(TAG, "🎯 Wakeword detected in SLEEP: '%s'! Waking up and switching to LISTENING...",
                  trigger_name);
         exit_sleep_mode(trigger_name);
         speech_accum_ms = chunk_duration_ms * WAKE_CONFIRM_CHUNKS;
@@ -811,7 +811,7 @@ static void continuous_mic_stream_task(void *pvParameters) {
                                          strlen(wake_evt), pdMS_TO_TICKS(500));
         }
       } else {
-        if (rms < 50.0f) wake_hits = 0;
+        wake_hits = 0;
       }
       continue;
     }
