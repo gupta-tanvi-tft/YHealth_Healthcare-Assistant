@@ -82,7 +82,7 @@ static void noise_floor_update(noise_floor_t *nf, float energy) {
 
 static inline float noise_floor_gate(noise_floor_t *nf, float energy) {
     if (!nf->primed && nf->head < 4) return energy;
-    float thresh = nf->current_floor * 2.2f;
+    float thresh = nf->current_floor * 1.20f;
     if (energy < thresh) return 0.0f;
     return energy - nf->current_floor;
 }
@@ -94,30 +94,25 @@ static inline float noise_floor_gate(noise_floor_t *nf, float energy) {
 typedef struct {
     bool s1_confirmed;
     int64_t last_s1_ms;
-    int s1_consecutive;
-    int s2_consecutive;
 } lira_detector_t;
 
 // HELLO ASSISTANT: "HELLO" (mid/low formant) -> "ASSISTANT" (sibilant fricative high burst)
 typedef struct {
     bool hello_confirmed;
     int64_t last_hello_ms;
-    int hello_consecutive;
-    int sis_consecutive;
 } hello_assistant_detector_t;
 
 static lira_detector_t s_lira = {0};
 static hello_assistant_detector_t s_ha = {0};
-static int s_speech_consecutive = 0;
 
 static inline int64_t get_time_ms(void) {
     return esp_timer_get_time() / 1000;
 }
 
 void wakeword_init(void) {
-    biquad_init_bandpass(&s_bp_low,  700.0f,  1.2f, SAMPLE_RATE);
-    biquad_init_bandpass(&s_bp_mid,  1400.0f, 1.2f, SAMPLE_RATE);
-    biquad_init_bandpass(&s_bp_high, 2600.0f, 1.2f, SAMPLE_RATE);
+    biquad_init_bandpass(&s_bp_low,  700.0f,  1.1f, SAMPLE_RATE);
+    biquad_init_bandpass(&s_bp_mid,  1400.0f, 1.1f, SAMPLE_RATE);
+    biquad_init_bandpass(&s_bp_high, 2600.0f, 1.1f, SAMPLE_RATE);
     wakeword_reset();
     ESP_LOGI(TAG, "Local wakeword engine initialized (targets: 'hello assistant', 'LIRA')");
 }
@@ -130,7 +125,6 @@ void wakeword_reset(void) {
     s_dc_y1 = 0.0f;
     memset(&s_lira, 0, sizeof(s_lira));
     memset(&s_ha, 0, sizeof(s_ha));
-    s_speech_consecutive = 0;
 }
 
 bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result_t *out_result) {
@@ -157,24 +151,16 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     }
     float raw_rms = sqrtf((float)(sum_sq / count));
 
-    // Fast reject on extreme silence
-    if (raw_rms < 35.0f) {
-        s_lira.s1_consecutive = 0;
-        s_lira.s2_consecutive = 0;
-        s_ha.hello_consecutive = 0;
-        s_ha.sis_consecutive = 0;
-        s_speech_consecutive = 0;
+    // Fast reject on extreme silence (quiet room ambient is < 25)
+    if (raw_rms < 25.0f) {
+        if (s_lira.s1_confirmed && (now - s_lira.last_s1_ms > 900)) s_lira.s1_confirmed = false;
+        if (s_ha.hello_confirmed && (now - s_ha.last_hello_ms > 1200)) s_ha.hello_confirmed = false;
         return false;
     }
 
-    // 2. Transient rejection (clicks, taps, throat clearing have crest factor > 4.5)
+    // 2. Transient rejection (clicks, sharp taps have crest factor > 5.5 and very high peak)
     float crest_factor = (raw_rms > 10.0f) ? (max_peak / raw_rms) : 0.0f;
-    if (crest_factor > 4.5f && raw_rms > 400.0f) {
-        s_lira.s1_consecutive = 0;
-        s_lira.s2_consecutive = 0;
-        s_ha.hello_consecutive = 0;
-        s_ha.sis_consecutive = 0;
-        s_speech_consecutive = 0;
+    if (crest_factor > 5.5f && raw_rms > 450.0f) {
         return false;
     }
 
@@ -208,39 +194,26 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // -------------------------------------------------------------
     // DETECTOR A: "LIRA" ("LEE" -> "RAH")
     // -------------------------------------------------------------
-    // Stage 1: "LEE" (/liː/) -> High formant dominance (concentrated ~2600Hz)
-    if (det_high > 110.0f &&
-        det_high > 1.20f * det_mid &&
-        det_high > 1.15f * det_low) {
-        s_lira.s1_consecutive++;
-        if (s_lira.s1_consecutive >= 2) {
-            s_lira.s1_confirmed = true;
-            s_lira.last_s1_ms = now;
-        }
-    } else {
-        s_lira.s1_consecutive = 0;
+    // Stage 1: "LEE" (/liː/) -> High formant dominance (~2600Hz)
+    if (det_high >= 14.0f && det_high > 0.85f * det_low) {
+        s_lira.s1_confirmed = true;
+        s_lira.last_s1_ms = now;
     }
 
-    // Stage 2: "RAH" (/rɑː/) -> Low formant dominance (concentrated ~700Hz)
+    // Stage 2: "RAH" (/rɑː/) -> Low formant dominance (~700Hz)
     if (s_lira.s1_confirmed) {
         int64_t delta = now - s_lira.last_s1_ms;
-        if (delta >= 100 && delta <= 900) {
-            if (det_low > 110.0f && det_low > 1.20f * det_high) {
-                s_lira.s2_consecutive++;
-                if (s_lira.s2_consecutive >= 2) {
-                    out_result->detected = true;
-                    out_result->confidence = 0.95f;
-                    out_result->keyword = "LIRA";
-                    wakeword_reset();
-                    ESP_LOGI(TAG, "🎯 Wakeword confirmed: 'LIRA' (delta=%lld ms, rms=%.1f)", delta, raw_rms);
-                    return true;
-                }
-            } else {
-                s_lira.s2_consecutive = 0;
+        if (delta >= 70 && delta <= 950) {
+            if (det_low >= 14.0f && det_low > 0.85f * det_high) {
+                out_result->detected = true;
+                out_result->confidence = 0.95f;
+                out_result->keyword = "LIRA";
+                wakeword_reset();
+                ESP_LOGI(TAG, "🎯 Wakeword confirmed: 'LIRA' (delta=%lld ms, rms=%.1f)", delta, raw_rms);
+                return true;
             }
-        } else if (delta > 900) {
+        } else if (delta > 950) {
             s_lira.s1_confirmed = false;
-            s_lira.s2_consecutive = 0;
         }
     }
 
@@ -248,38 +221,25 @@ bool wakeword_feed_samples(const int16_t *samples, size_t count, wakeword_result
     // DETECTOR B: "HELLO ASSISTANT" ("HELLO" / "HEY" -> "ASSISTANT")
     // -------------------------------------------------------------
     // Stage 1: "HELLO" / "HEY" -> Mid/Low vowel formant concentration
-    if ((det_mid + det_low) > 130.0f &&
-        (det_mid + det_low) > 1.20f * det_high &&
-        raw_rms > 70.0f) {
-        s_ha.hello_consecutive++;
-        if (s_ha.hello_consecutive >= 2) {
-            s_ha.hello_confirmed = true;
-            s_ha.last_hello_ms = now;
-        }
-    } else {
-        s_ha.hello_consecutive = 0;
+    if ((det_mid + det_low) >= 18.0f && raw_rms >= 30.0f) {
+        s_ha.hello_confirmed = true;
+        s_ha.last_hello_ms = now;
     }
 
     // Stage 2: "ASSISTANT" -> Sibilant "SIS" burst (high frequency)
     if (s_ha.hello_confirmed) {
         int64_t delta_ha = now - s_ha.last_hello_ms;
-        if (delta_ha >= 120 && delta_ha <= 1200) {
-            if (det_high > 110.0f && (det_high > 1.15f * det_low && det_high > 1.15f * det_mid)) {
-                s_ha.sis_consecutive++;
-                if (s_ha.sis_consecutive >= 2) {
-                    out_result->detected = true;
-                    out_result->confidence = 0.95f;
-                    out_result->keyword = "HELLO ASSISTANT";
-                    wakeword_reset();
-                    ESP_LOGI(TAG, "🎯 Wakeword confirmed: 'HELLO ASSISTANT' (delta=%lld ms, rms=%.1f)", delta_ha, raw_rms);
-                    return true;
-                }
-            } else {
-                s_ha.sis_consecutive = 0;
+        if (delta_ha >= 90 && delta_ha <= 1250) {
+            if (det_high >= 15.0f) {
+                out_result->detected = true;
+                out_result->confidence = 0.95f;
+                out_result->keyword = "HELLO ASSISTANT";
+                wakeword_reset();
+                ESP_LOGI(TAG, "🎯 Wakeword confirmed: 'HELLO ASSISTANT' (delta=%lld ms, rms=%.1f)", delta_ha, raw_rms);
+                return true;
             }
-        } else if (delta_ha > 1200) {
+        } else if (delta_ha > 1250) {
             s_ha.hello_confirmed = false;
-            s_ha.sis_consecutive = 0;
         }
     }
 

@@ -2596,9 +2596,11 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                         except Exception:
                             user_text = ""
                         if user_text:
-                            logger.info(f"🎤 [Doctor Spoke]: '{user_text}'")
+                            logger.info(f"🎤 [Doctor Spoke / Wake Word]: '{user_text}'")
                             if quota_waiting or not gemini_has_been_active or S.get("gemini_error"):
                                 asyncio.create_task(process_fallback_utterance(user_text))
+                            else:
+                                await queue_put(("text", user_text))
                     elif "interrupt" in text:
                         streaming = False
                         S["suppress_output"] = True
@@ -2967,6 +2969,17 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                 except Exception as e:
                                     S["gemini_error"] = e
                                     logger.warning(f"audio_stream_end error: {e}. Reconnecting...")
+                                    break
+                            elif kind == "text":
+                                S["last_activity"] = loop.time()
+                                S["last_rx"] = loop.time()
+                                S["turn_pending"] = True
+                                try:
+                                    await session.send(input=data, end_of_turn=True)
+                                    logger.info(f"🎤 [Wake prompt sent to Gemini]: '{data}'")
+                                except Exception as e:
+                                    S["gemini_error"] = e
+                                    logger.warning(f"Gemini text send error: {e}. Reconnecting...")
                                     break
                     finally:
                         ka_task.cancel()
