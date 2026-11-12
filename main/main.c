@@ -71,11 +71,11 @@ static const char *TAG = "GEMINI_ASSISTANT";
 // STATE
 // ==========================================================
 typedef enum {
-  CONV_STATE_SLEEP = 0, // WebSocket disconnected, breathing RED light
-  CONV_STATE_STANDBY,   // breathing blue, waiting for voice
-  CONV_STATE_LISTENING, // streaming mic to Gemini (green)
-  CONV_STATE_THINKING,  // utterance ended, waiting for reply (amber)
-  CONV_STATE_SPEAKING   // playing Gemini audio (purple)
+  CONV_STATE_SLEEP = 0, // LED_COLOR_SLEEP    (0x32F014 Parrot Green)
+  CONV_STATE_STANDBY,   // LED_COLOR_STANDBY  (0x32F014 Parrot Green)
+  CONV_STATE_LISTENING, // LED_COLOR_LISTENING (0xF573A5 Soft Pink)
+  CONV_STATE_THINKING,  // LED_COLOR_THINKING  (0x5AE182 Pastel Green)
+  CONV_STATE_SPEAKING   // LED_COLOR_SPEAKING  (0x0FD2E6 Teal Blue)
 } conv_state_t;
 
 static volatile conv_state_t s_conv_state = CONV_STATE_STANDBY;
@@ -207,12 +207,63 @@ static void request_interruption(const char *reason) {
 }
 
 // ==========================================================
+// 🎨 LED COLOR CONFIG — PASTE HEX CODES HERE & REFLASH
+// ==========================================================
+// Format: 0xRRGGBB  (same as CSS/HTML color codes, just replace # with 0x)
+//
+// STATE               │ COLOR NAME        │ HEX CODE     │ ANIMATION
+// ────────────────────┼───────────────────┼──────────────┼─────────────
+// Sleep / Standby     │ Parrot Green      │ 0x32F014     │ Slow breathing
+// WS Disconnected     │ Parrot Green      │ 0x37F519     │ Fast blink
+// Listening           │ Soft Pink         │ 0xF573A5     │ Pulsing
+// Thinking            │ Pastel Green      │ 0x5AE182     │ Pulsing
+// Speaking            │ Teal Blue         │ 0x0FD2E6     │ Wave
+
+#define LED_COLOR_SLEEP         0x32F014   // Parrot Green  — sleeping / waiting for wake word
+#define LED_COLOR_STANDBY       0x32F014   // Parrot Green  — standby, waiting for voice
+#define LED_COLOR_DISCONNECTED  0x37F519   // Parrot Green  — WebSocket reconnecting
+#define LED_COLOR_LISTENING     0xF573A5   // Soft Pink     — mic active, capturing voice
+#define LED_COLOR_THINKING      0x5AE182   // Pastel Green  — processing query
+#define LED_COLOR_SPEAKING      0x0FD2E6   // Teal Blue     — playing response audio
+
+// Breathing / pulse speeds (lower = slower, higher = faster)
+#define LED_ANIM_SLEEP_SPEED     0.08f   // very slow calm breathing
+#define LED_ANIM_STANDBY_SPEED   0.10f   // calm standby pulse
+#define LED_ANIM_DISCONN_SPEED   0.20f   // faster blink = needs attention
+#define LED_ANIM_LISTEN_SPEED    0.25f   // medium pulse while listening
+#define LED_ANIM_THINK_SPEED     0.30f   // slightly faster = working
+#define LED_ANIM_SPEAK_SPEED     0.35f   // wave animation speed
+
+// Brightness range: min..max (0.0 to 1.0)
+#define LED_BRIGHTNESS_MIN       0.35f   // dimmest point of breathing cycle
+#define LED_BRIGHTNESS_MAX       1.00f   // brightest point of breathing cycle
+
+// Helper macros — extract R, G, B from 0xRRGGBB
+#define HEX_R(c) (uint8_t)(((c) >> 16) & 0xFF)
+#define HEX_G(c) (uint8_t)(((c) >>  8) & 0xFF)
+#define HEX_B(c) (uint8_t)(((c)      ) & 0xFF)
+
+// ==========================================================
 // LED ANIMATION (3 centre LEDs: 2, 3, 4) — runs on Core 0 @ 20 fps
 // ==========================================================
 static inline void set_center(uint8_t r, uint8_t g, uint8_t b) {
   rgb_led_set_pixel(2, r, g, b);
   rgb_led_set_pixel(3, r, g, b);
   rgb_led_set_pixel(4, r, g, b);
+}
+
+// Apply a hex color with a brightness multiplier (0.0 – 1.0)
+static inline void set_center_hex(uint32_t hex_color, float brightness) {
+  set_center((uint8_t)(HEX_R(hex_color) * brightness),
+             (uint8_t)(HEX_G(hex_color) * brightness),
+             (uint8_t)(HEX_B(hex_color) * brightness));
+}
+
+// Breathing effect: smoothly oscillates between LED_BRIGHTNESS_MIN and LED_BRIGHTNESS_MAX
+static inline float breathing(uint32_t step, float speed) {
+  return LED_BRIGHTNESS_MIN +
+         (LED_BRIGHTNESS_MAX - LED_BRIGHTNESS_MIN) *
+         (1.0f + sinf(step * speed)) / 2.0f;
 }
 
 static void enter_sleep_mode(const char *reason);
@@ -229,58 +280,44 @@ static void led_animation_task(void *pvParameters) {
     if (t < s_vol_overlay_until_ms) {
       rgb_led_set_vu_meter(s_vol_overlay_level);
     } else if (s_ws_sleep || s_conv_state == CONV_STATE_SLEEP) {
-      // Manual: Bright Parrot Green (Solid/Blinking) - In sleep mode / waiting
-      // for wake word
       rgb_led_clear();
-      float b = 0.35f + 0.65f * (1.0f + sinf(step * 0.08f)) / 2.0f;
-      set_center((uint8_t)(50 * b), (uint8_t)(240 * b), (uint8_t)(20 * b));
+      set_center_hex(LED_COLOR_SLEEP, breathing(step, LED_ANIM_SLEEP_SPEED));
       rgb_led_refresh();
     } else if (!s_ws_connected) {
-      // Manual: Bright Parrot Green (Solid/Blinking) - Disconnected / waiting
-      // for reconnect
       rgb_led_clear();
-      float b = 0.3f + 0.7f * (1.0f + sinf(step * 0.2f)) / 2.0f;
-      set_center((uint8_t)(55 * b), (uint8_t)(245 * b), (uint8_t)(25 * b));
+      set_center_hex(LED_COLOR_DISCONNECTED, breathing(step, LED_ANIM_DISCONN_SPEED));
       rgb_led_refresh();
     } else {
       rgb_led_clear();
       switch (s_conv_state) {
-      case CONV_STATE_SLEEP: {
-        // Bright Parrot Green (slow calm breathing)
-        float b = 0.35f + 0.65f * (1.0f + sinf(step * 0.08f)) / 2.0f;
-        set_center((uint8_t)(50 * b), (uint8_t)(240 * b), (uint8_t)(20 * b));
+      case CONV_STATE_SLEEP:
+        set_center_hex(LED_COLOR_SLEEP, breathing(step, LED_ANIM_SLEEP_SPEED));
         break;
-      }
-      case CONV_STATE_STANDBY: {
-        // Bright Parrot Green (calm standby waiting for wake word)
-        float b = 0.4f + 0.6f * (1.0f + sinf(step * 0.1f)) / 2.0f;
-        set_center((uint8_t)(50 * b), (uint8_t)(240 * b), (uint8_t)(20 * b));
+      case CONV_STATE_STANDBY:
+        set_center_hex(LED_COLOR_STANDBY, breathing(step, LED_ANIM_STANDBY_SPEED));
         break;
-      }
-      case CONV_STATE_LISTENING: {
-        // Manual: Pastel / Soft Pink (Pulsing) - Speak now, assistant capturing
-        // voice
-        float b = 0.5f + 0.5f * (1.0f + sinf(step * 0.25f)) / 2.0f;
-        set_center((uint8_t)(245 * b), (uint8_t)(115 * b), (uint8_t)(165 * b));
+      case CONV_STATE_LISTENING:
+        set_center_hex(LED_COLOR_LISTENING, breathing(step, LED_ANIM_LISTEN_SPEED));
         break;
-      }
-      case CONV_STATE_THINKING: {
-        // Manual: Pastel Green (Pulsing) - Assistant processing query
-        float b = 0.4f + 0.6f * (1.0f + sinf(step * 0.3f)) / 2.0f;
-        set_center((uint8_t)(90 * b), (uint8_t)(225 * b), (uint8_t)(130 * b));
+      case CONV_STATE_THINKING:
+        set_center_hex(LED_COLOR_THINKING, breathing(step, LED_ANIM_THINK_SPEED));
         break;
-      }
       case CONV_STATE_SPEAKING: {
-        // Manual: Teal Blue (Pulsing / Wave) - Assistant answering over speaker
-        float w2 = (1.0f + sinf(step * 0.35f)) / 2.0f;
-        float w3 = (1.0f + sinf(step * 0.35f + 1.0f)) / 2.0f;
-        float w4 = (1.0f + sinf(step * 0.35f + 2.0f)) / 2.0f;
-        rgb_led_set_pixel(2, (uint8_t)(15 * w2), (uint8_t)(210 * w2),
-                          (uint8_t)(230 * w2));
-        rgb_led_set_pixel(3, (uint8_t)(15 * w3), (uint8_t)(210 * w3),
-                          (uint8_t)(230 * w3));
-        rgb_led_set_pixel(4, (uint8_t)(15 * w4), (uint8_t)(210 * w4),
-                          (uint8_t)(230 * w4));
+        // Wave effect: each LED has a phase offset for a ripple look
+        float w2 = breathing(step, LED_ANIM_SPEAK_SPEED);
+        float w3 = LED_BRIGHTNESS_MIN + (LED_BRIGHTNESS_MAX - LED_BRIGHTNESS_MIN) *
+                   (1.0f + sinf(step * LED_ANIM_SPEAK_SPEED + 1.0f)) / 2.0f;
+        float w4 = LED_BRIGHTNESS_MIN + (LED_BRIGHTNESS_MAX - LED_BRIGHTNESS_MIN) *
+                   (1.0f + sinf(step * LED_ANIM_SPEAK_SPEED + 2.0f)) / 2.0f;
+        rgb_led_set_pixel(2, (uint8_t)(HEX_R(LED_COLOR_SPEAKING) * w2),
+                             (uint8_t)(HEX_G(LED_COLOR_SPEAKING) * w2),
+                             (uint8_t)(HEX_B(LED_COLOR_SPEAKING) * w2));
+        rgb_led_set_pixel(3, (uint8_t)(HEX_R(LED_COLOR_SPEAKING) * w3),
+                             (uint8_t)(HEX_G(LED_COLOR_SPEAKING) * w3),
+                             (uint8_t)(HEX_B(LED_COLOR_SPEAKING) * w3));
+        rgb_led_set_pixel(4, (uint8_t)(HEX_R(LED_COLOR_SPEAKING) * w4),
+                             (uint8_t)(HEX_G(LED_COLOR_SPEAKING) * w4),
+                             (uint8_t)(HEX_B(LED_COLOR_SPEAKING) * w4));
         break;
       }
       }
