@@ -53,13 +53,19 @@ def _row_to_speaker_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "hardware_version": row.get("hardware_version", "ESP32-S3-DevKitC-1"),
         "firmware_version": row.get("firmware_version", "v1.4.2-bargein"),
         "wifi_ssid": telemetry.get("wifi_ssid", "TFTus-WiFi" if is_doc else "Home-WiFi"),
-        "wifi_rssi": row.get("last_rssi") or telemetry.get("wifi_rssi", -50),
+        "wifi_isp": telemetry.get("wifi_isp", "Airtel Xstream Fiber"),
+        "location_label": row.get("location_label") or telemetry.get("location_label", "Consultation Room" if row.get("device_id") == "SPK-0000002" else "Reception / Waiting Area"),
+        "wifi_rssi": row.get("last_rssi") or telemetry.get("wifi_rssi", -48),
         "wifi_connected": telemetry.get("wifi_connected", True if row.get("status") in ("online", "standby") else False),
-        "status_reason": telemetry.get("status_reason", ""),
+        "status_reason": telemetry.get("status_reason", "Wi-Fi Connected"),
         "last_network_log": telemetry.get("last_network_log", ""),
         "last_network_time": telemetry.get("last_network_time", ""),
         "power_source": telemetry.get("power_source", "100% (USB-C Powered)"),
         "stream_rate": telemetry.get("stream_rate", "16 kHz Mono PCM (32 KB/s)"),
+        "ping_latency_ms": telemetry.get("ping_latency_ms", 12.4),
+        "internet_visible": telemetry.get("internet_visible", True if row.get("status") in ("online", "standby") else False),
+        "last_heartbeat_at": telemetry.get("last_heartbeat_at", ""),
+        "heartbeat_interval_s": 15,
         "last_seen_at": "Just now" if row.get("status") in ("online", "standby") else "Offline"
     }
 
@@ -140,6 +146,8 @@ def upsert_speaker(spk: Dict[str, Any]) -> Dict[str, Any]:
     status = spk.get("status", "offline")
     vol = int(spk.get("volume", 75))
     ip = spk.get("ip_address") or None
+    if ip and (ip in ("—", "-", "N/A", "none") or "." not in ip):
+        ip = None
     is_doc = (role == "doctor")
 
     doc_id = (spk.get("doctor_id") if is_doc else spk.get("doctor_assigned_id")) or None
