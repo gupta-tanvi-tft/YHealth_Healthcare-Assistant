@@ -1004,9 +1004,23 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
         stress = face_scan.get("stress_metrics") or {}
         if isinstance(stress, dict) and stress.get("stress_level"):
             key_labs["stress_level"] = stress.get("stress_level")
+            if stress.get("stress_index") is not None:
+                key_labs["stress_index"] = stress.get("stress_index")
         wellness = face_scan.get("wellness_metrics") or {}
         if isinstance(wellness, dict) and wellness.get("wellness_level"):
             key_labs["wellness_level"] = wellness.get("wellness_level")
+            if wellness.get("wellness_index") is not None:
+                key_labs["wellness_index"] = wellness.get("wellness_index")
+        hrv = face_scan.get("hrv_metrics") or {}
+        if isinstance(hrv, dict) and hrv:
+            hrv_clean = {hk: hrv[hk] for hk in ("sdnn", "rmssd", "prq", "lf_hf_ratio") if hrv.get(hk) is not None}
+            if hrv_clean:
+                key_labs["hrv_metrics"] = hrv_clean
+        auto = face_scan.get("autonomic_balance") or {}
+        if isinstance(auto, dict) and auto:
+            auto_clean = {ak: auto[ak] for ak in ("pns_zone", "sns_zone") if auto.get(ak)}
+            if auto_clean:
+                key_labs["autonomic_balance"] = auto_clean
 
     labs_prof = p.get("lab_results_profile") or {}
     latest_report = labs_prof.get("latest_report") if isinstance(labs_prof, dict) else {}
@@ -1084,12 +1098,22 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
     else:
         slice_data["active_medications"] = "None recorded"
 
-    # 7. Care Program
-    prog = p.get("care_team", {}).get("current_program") if isinstance(p.get("care_team"), dict) else {}
+    # 7. Care Program & Doctor
+    care = p.get("care_team") if isinstance(p.get("care_team"), dict) else {}
+    prog = care.get("current_program") if isinstance(care, dict) else {}
     if isinstance(prog, dict) and prog.get("program_name"):
         slice_data["care_program"] = prog.get("program_name")
+    doc = care.get("assigned_doctor") if isinstance(care, dict) else {}
+    if isinstance(doc, dict) and doc.get("name"):
+        slice_data["assigned_doctor"] = doc.get("name")
 
-    # 8. Recent Summary Notes
+    # 8. Emergency Flags
+    meta = p.get("_meta") if isinstance(p.get("_meta"), dict) else {}
+    em_flags = meta.get("emergency_flags") if isinstance(meta, dict) else {}
+    if isinstance(em_flags, dict) and em_flags:
+        slice_data["emergency_flags"] = em_flags
+
+    # 9. Recent Summary Notes
     ns = p.get("narrative_summary") or {}
     summary_note = ns.get("short_summary") if isinstance(ns, dict) else (p.get("summary") or p.get("notes"))
     if summary_note:
