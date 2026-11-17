@@ -953,6 +953,12 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
     wl_cal = anth.get("weight_loss_calories_kcal") if isinstance(anth, dict) else None
     if wl_cal:
         body_comp["weight_loss_calories"] = f"{wl_cal} kcal"
+    fat = (anth.get("body_fat_percent") if isinstance(anth, dict) else None) or (wt_meas.get("body_fat_percent") if isinstance(wt_meas, dict) else None)
+    if fat and float(fat) > 0:
+        body_comp["body_fat"] = f"{fat}%"
+    muscle = (anth.get("muscle_mass_kg") if isinstance(anth, dict) else None) or (wt_meas.get("muscle_mass_kg") if isinstance(wt_meas, dict) else None)
+    if muscle and float(muscle) > 0:
+        body_comp["muscle_mass"] = f"{muscle} kg"
     if body_comp:
         slice_data["body_composition"] = body_comp
 
@@ -966,6 +972,26 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
             v = vitals.get(k)
             if v is not None and v != "":
                 clean_vitals[k] = v.get("value") if isinstance(v, dict) else v
+
+    # Direct Blood Pressure Profile
+    bp_prof = p.get("blood_pressure_profile", {}).get("latest_measurement") if isinstance(p.get("blood_pressure_profile"), dict) else {}
+    if isinstance(bp_prof, dict) and bp_prof:
+        sys_bp = bp_prof.get("systolic") or bp_prof.get("systolic_bp")
+        dia_bp = bp_prof.get("diastolic") or bp_prof.get("diastolic_bp")
+        if sys_bp and dia_bp:
+            clean_vitals["blood_pressure"] = f"{sys_bp}/{dia_bp} mmHg"
+
+    # Direct Glucometer Profile
+    gluc_prof = p.get("glucometer_profile", {}) if isinstance(p.get("glucometer_profile"), dict) else {}
+    if isinstance(gluc_prof, dict) and gluc_prof:
+        latest_g = gluc_prof.get("latest_reading") or gluc_prof.get("latest_measurement")
+        if isinstance(latest_g, dict):
+            gv = latest_g.get("glucose_mg_dl") or latest_g.get("value")
+            meal = latest_g.get("meal_tag") or latest_g.get("type") or ""
+            if gv:
+                clean_vitals["glucometer_glucose"] = f"{gv} mg/dL ({meal})".strip()
+        elif gluc_prof.get("fasting_glucose"):
+            clean_vitals["fasting_glucose"] = f"{gluc_prof.get('fasting_glucose')} mg/dL"
 
     face_scan = p.get("face_scan_profile", {}).get("latest_scan") if isinstance(p.get("face_scan_profile"), dict) else {}
     if isinstance(face_scan, dict) and face_scan:
@@ -1309,6 +1335,7 @@ def build_doctor_agent_prompt(
         "- REAL-TIME CLOCK (IST): You are grounded with an accurate real-time clock in Indian Standard Time (IST, UTC+5:30). State current time in 1 sentence. Call get_current_time if needed.\n"
         "- PATIENT LOOKUP & FAST CONFIRMATION: When a patient is named, immediately call load_patient_record. Once loaded, confirm in strictly ONE short sentence (e.g. '<Name>'s record loaded, <Age>yo <Gender>. What would you like to check, Doctor?' or 'Ji Doctor, <Name> ka record load ho gaya hai. Kya check karna hai?'). NEVER recite long unasked lists of missing fields or negative findings during confirmation. If ambiguous, ask for last 4 digits of phone, then call confirm_patient_by_phone_last4.\n"
         "- CLINICAL QUERIES WITH AN ACTIVE PATIENT: When an active patient is loaded, ANY clinical question (e.g. 'what is their hemoglobin?', 'sugar kitna hai?', 'vitals check karo', 'unka weight kya hai?', 'blood pressure?', 'HbA1c kitna hai?') refers directly to the ACTIVE PATIENT. Answer immediately using the loaded patient's data in 1 short sentence. NEVER ask 'Which patient?' or 'Kis patient ka?' when a patient is already active.\n"
+        "- SWITCHING PATIENTS: If a patient is already active and Dr. Makkar asks to check, switch to, or names a different patient (e.g. 'Now check Rajiv Khattar', 'Open Sunil Sharma', 'Dusra patient dekho'), immediately call load_patient_record for the new patient. Once loaded, confirm in 1 short sentence. All subsequent questions now refer to the new patient.\n"
         "- TODAY'S SCHEDULE: When asked about appointments, summarize from TODAY'S SCHEDULE in 1-2 sentences. Call get_doctor_consultations for date queries.\n"
         "- CLINICAL NOTES: Repeat note back once for confirmation, call add_clinical_note, then say: 'Note saved.'\n"
         "- ALERTS: Confirm alert type, call escalate_alert, then say: 'Alert sent.'\n"
