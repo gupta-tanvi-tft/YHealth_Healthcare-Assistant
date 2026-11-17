@@ -723,9 +723,22 @@ ACTIVE_ESP_CONNECTIONS: dict = {}
 @app.get("/api/active-speakers")
 async def get_active_connected_speakers():
     """Returns currently connected hardware WebSockets and their live status."""
+    safe_connections = []
+    for conn in list(ACTIVE_ESP_CONNECTIONS.values()):
+        safe_connections.append({
+            "connection_id": conn.get("connection_id"),
+            "device_label": conn.get("device_label"),
+            "doctor_id": conn.get("doctor_id"),
+            "client_ip": conn.get("client_ip"),
+            "wifi_ssid": conn.get("wifi_ssid"),
+            "wifi_rssi": conn.get("wifi_rssi"),
+            "connected_at": conn.get("connected_at"),
+            "status": conn.get("status", "online"),
+            "wifi_connected": conn.get("wifi_connected", True),
+        })
     return {
         "count": len(ACTIVE_ESP_CONNECTIONS),
-        "connections": list(ACTIVE_ESP_CONNECTIONS.values()),
+        "connections": safe_connections,
         "server_time": datetime.now(timezone.utc).isoformat()
     }
 
