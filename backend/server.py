@@ -1283,7 +1283,7 @@ def build_doctor_agent_prompt(
         f"- GREETING: On wake word or initial session greeting, greet in 1 short sentence without language prefixes (e.g. 'Good {tod}, {salutation}. Which patient would you like to start with?' or in Hinglish: 'Namaste {salutation}, aaj kis patient se start karna hai?'). NEVER use 'mariz' and never output language labels like 'English:' or 'Hindi:'.\n"
         f"- ACTIVE PATIENT RESUMPTION: If a patient record is already active and the user says 'Hello', checks in, or resumes speaking, DO NOT repeat the formal time-of-day greeting. Instead reply: 'Yes {salutation}, how can I help with the patient?' (or 'Ji {salutation}, patient ke bare mein kya janna chahte hain?').\n"
         "- REAL-TIME CLOCK (IST): You are grounded with an accurate real-time clock in Indian Standard Time (IST, UTC+5:30). State current time in 1 sentence. Call get_current_time if needed.\n"
-        "- PATIENT LOOKUP: When named, immediately call load_patient_record. Say: 'One moment, pulling up that record.' Confirm full name in 1 sentence. If ambiguous, ask for last 4 digits of phone, then call confirm_patient_by_phone_last4.\n"
+        "- PATIENT LOOKUP & FAST CONFIRMATION: When a patient is named, immediately call load_patient_record. Once loaded, confirm in strictly ONE short sentence (e.g. '<Name>'s record loaded, <Age>yo <Gender>. What would you like to check, Doctor?' or 'Ji Doctor, <Name> ka record load ho gaya hai. Kya check karna hai?'). NEVER recite long unasked lists of missing fields or negative findings during confirmation. If ambiguous, ask for last 4 digits of phone, then call confirm_patient_by_phone_last4.\n"
         "- TODAY'S SCHEDULE: When asked about appointments, summarize from TODAY'S SCHEDULE in 1-2 sentences. Call get_doctor_consultations for date queries.\n"
         "- CLINICAL NOTES: Repeat note back once for confirmation, call add_clinical_note, then say: 'Note saved.'\n"
         "- ALERTS: Confirm alert type, call escalate_alert, then say: 'Alert sent.'\n"
@@ -1885,7 +1885,8 @@ def _extract_patient_roster(data):
 
 
 def match_patients(roster: list, query: str) -> list:
-    """Match exact patient IDs or exact name tokens; phones are duplicate-only."""
+    """Robust multi-tier patient matcher supporting full names, single names, distinct surnames, and phonetic voice transcriptions."""
+    import difflib
     q = _normalize_query(query)
     query_id = re.sub(r"[^a-z0-9]", "", str(query or "").casefold())
     if not (q or len(query_id) >= 6) or not roster:
@@ -1899,24 +1900,65 @@ def match_patients(roster: list, query: str) -> list:
         row_id = _roster_row_id(p)
         rows.append((p, name_key, set(name_key.split()), pid, row_id, ids, phones))
 
-    # IDs must match exactly; a phone number is deliberately not a general search key.
+    # 1. Exact ID match (>= 6 chars)
     chosen = [r for r in rows if len(query_id) >= 6 and query_id in r[5]]
-    if not chosen:
-        if not q:
-            return []
-        q_tokens = set(q.split())
-        full_exact = [r for r in rows if r[1] == q]
-        # Prefer a full-name exact match. Otherwise allow exact spoken name tokens
-        # in any order (e.g. first name only), never substring/fuzzy lookalikes.
-        chosen = full_exact or [r for r in rows if q_tokens and q_tokens.issubset(r[2])]
+    if chosen:
+        return [r[0] for r in chosen]
 
-    seen, out = set(), []
-    for r in chosen:
-        key = r[4] or f"{r[1]}:{id(r[0])}"
-        if key not in seen:
-            seen.add(key)
-            out.append(r[0])
-    return out
+    if not q:
+        return []
+
+    q_tokens = set(q.split())
+
+    # 2. Exact full name match
+    full_exact = [r for r in rows if r[1] == q]
+    if full_exact:
+        return [r[0] for r in full_exact]
+
+    # 3. All query tokens match a subset of patient name tokens (e.g. "Anil" in "Anil Kharbanda", "Kharbanda" in "Anil Kharbanda")
+    subset_matches = [r for r in rows if q_tokens and q_tokens.issubset(r[2])]
+    if subset_matches:
+        return [r[0] for r in subset_matches]
+
+    # 4. Token overlap on distinct name tokens (length >= 4 chars, e.g. "Kharbanda" in "Sunil Kharbanda")
+    distinct_overlap = []
+    for r in rows:
+        shared = {tok for tok in (q_tokens & r[2]) if len(tok) >= 4}
+        if shared:
+            distinct_overlap.append((r, len(shared)))
+    if distinct_overlap:
+        distinct_overlap.sort(key=lambda x: x[1], reverse=True)
+        max_shared = distinct_overlap[0][1]
+        best_overlap = [item[0] for item in distinct_overlap if item[1] == max_shared]
+        if len(best_overlap) == 1:
+            return [best_overlap[0][0]]
+        return [r[0] for r in best_overlap]
+
+    # 5. Substring / Root match (e.g. "banda" in "kharbanda")
+    sub_matches = [r for r in rows if any(len(tok) >= 4 and (tok in r[1] or any(tok in name_tok for name_tok in r[2])) for tok in q_tokens)]
+    if sub_matches:
+        if len(sub_matches) == 1:
+            return [sub_matches[0][0]]
+        return [r[0] for r in sub_matches]
+
+    # 6. Phonetic / Fuzzy fallback (edit distance <= 2 for voice transcription variations)
+    fuzzy_matches = []
+    for r in rows:
+        for q_tok in q_tokens:
+            if len(q_tok) < 4:
+                continue
+            for r_tok in r[2]:
+                ratio = difflib.SequenceMatcher(None, q_tok, r_tok).ratio()
+                if ratio >= 0.80:
+                    fuzzy_matches.append((r, ratio))
+    if fuzzy_matches:
+        fuzzy_matches.sort(key=lambda x: x[1], reverse=True)
+        top_ratio = fuzzy_matches[0][1]
+        best_fuzzy = [item[0] for item in fuzzy_matches if item[1] >= top_ratio - 0.05]
+        if len(best_fuzzy) == 1:
+            return [best_fuzzy[0][0]]
+
+    return []
 
 
 def _phone_digits_for_record(record: dict) -> set:
