@@ -1284,6 +1284,7 @@ def build_doctor_agent_prompt(
         f"- ACTIVE PATIENT RESUMPTION: If a patient record is already active and the user says 'Hello', checks in, or resumes speaking, DO NOT repeat the formal time-of-day greeting. Instead reply: 'Yes {salutation}, how can I help with the patient?' (or 'Ji {salutation}, patient ke bare mein kya janna chahte hain?').\n"
         "- REAL-TIME CLOCK (IST): You are grounded with an accurate real-time clock in Indian Standard Time (IST, UTC+5:30). State current time in 1 sentence. Call get_current_time if needed.\n"
         "- PATIENT LOOKUP & FAST CONFIRMATION: When a patient is named, immediately call load_patient_record. Once loaded, confirm in strictly ONE short sentence (e.g. '<Name>'s record loaded, <Age>yo <Gender>. What would you like to check, Doctor?' or 'Ji Doctor, <Name> ka record load ho gaya hai. Kya check karna hai?'). NEVER recite long unasked lists of missing fields or negative findings during confirmation. If ambiguous, ask for last 4 digits of phone, then call confirm_patient_by_phone_last4.\n"
+        "- CLINICAL QUERIES WITH AN ACTIVE PATIENT: When an active patient is loaded, ANY clinical question (e.g. 'what is their hemoglobin?', 'sugar kitna hai?', 'vitals check karo', 'unka weight kya hai?', 'blood pressure?', 'HbA1c kitna hai?') refers directly to the ACTIVE PATIENT. Answer immediately using the loaded patient's data in 1 short sentence. NEVER ask 'Which patient?' or 'Kis patient ka?' when a patient is already active.\n"
         "- TODAY'S SCHEDULE: When asked about appointments, summarize from TODAY'S SCHEDULE in 1-2 sentences. Call get_doctor_consultations for date queries.\n"
         "- CLINICAL NOTES: Repeat note back once for confirmation, call add_clinical_note, then say: 'Note saved.'\n"
         "- ALERTS: Confirm alert type, call escalate_alert, then say: 'Alert sent.'\n"
@@ -2018,10 +2019,6 @@ async def _load_selected_patient(record: dict, doctor_id: str, connection_id: st
         {"roster_id": row_id, "persona_id": resolved_id, "source": "verified_api2"},
         REDIS_PERSONA_MAP_TTL_S,
     )
-    await set_conversation_state(doctor_id, connection_id, "active_patient",
-                                 {"patient_id": row_id, "persona_id": resolved_id,
-                                  "patient_name": full}, REDIS_SESSION_TTL_S)
-    logger.info("API 2 persona loaded and identity-verified for the uniquely matched roster patient")
     sliced = build_tool_patient_data(persona)
     bc = sliced.get("body_composition", {}) if isinstance(sliced.get("body_composition"), dict) else {}
     vt = sliced.get("vitals", {}) if isinstance(sliced.get("vitals"), dict) else {}
@@ -2040,6 +2037,8 @@ async def _load_selected_patient(record: dict, doctor_id: str, connection_id: st
         overview_parts.append(f"Vitals: Pulse {vt.get('pulse_rate', 'N/A')}, SpO2 {vt.get('spo2', 'N/A')}, Resp {vt.get('respiration_rate', 'N/A')}")
     if ls:
         risk_strs = []
+        if ls.get("hemoglobin_face_scan"):
+            risk_strs.append(f"Hemoglobin: {ls['hemoglobin_face_scan']}")
         if ls.get("diabetes_screening_risk"):
             risk_strs.append(f"Diabetes Risk: {ls['diabetes_screening_risk']}")
         if ls.get("hypertension_screening_risk"):
@@ -2050,6 +2049,17 @@ async def _load_selected_patient(record: dict, doctor_id: str, connection_id: st
             overview_parts.append(f"Screening: {', '.join(risk_strs)}")
     overview_parts.append(f"Confirmed Diagnoses: {sliced.get('confirmed_diagnoses', 'None recorded')}")
     clinical_overview_str = ". ".join(overview_parts) + "."
+
+    # Save comprehensive active patient state in Redis / RAM session fallback
+    await set_conversation_state(doctor_id, connection_id, "active_patient", {
+        "patient_id": row_id,
+        "persona_id": resolved_id,
+        "patient_name": full,
+        "clinical_overview": clinical_overview_str,
+        "patient_data": sliced,
+        "persona_str": json.dumps(sliced, indent=2),
+    }, REDIS_SESSION_TTL_S)
+    logger.info(f"🧠 Saved active patient memory: '{full}' (session TTL: {REDIS_SESSION_TTL_S}s)")
 
     return {
         "status": "found",
@@ -2071,7 +2081,6 @@ async def resolve_patient(name_query: str, doctor_id: str = None, connection_id:
         if pending:
             return await resolve_patient_by_phone_last4(name_query, session_doctor_id, connection_id)
     await delete_conversation_state(session_doctor_id, connection_id, "pending_patient")
-    await delete_conversation_state(session_doctor_id, connection_id, "active_patient")
     roster_id = PATIENTS_API_DOCTOR_ID
     roster = await async_fetch_patient_list(roster_id)
     if not roster:
@@ -2624,7 +2633,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
     gemini_client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version=LIVE_API_VERSION))
     loop = asyncio.get_event_loop()
 
-    resume = {"handle": None}
+    saved_resume_handle = await get_conversation_state(doctor_id, connection_id, "gemini_resume_handle")
+    resume = {"handle": saved_resume_handle}
     advanced = os.getenv("LIVE_ADVANCED", "1") != "0"   # resumption + compression + transcription
 
     # Dynamic Fleet Speaker Mapping Lookup (Supports multiple doctors & patients concurrently)
@@ -2656,7 +2666,21 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         # Load doctor persona & daily consultations (cached once per day in Redis/RAM)
         today_str = get_today_date_str()
         doctor_persona = await async_fetch_doctor_persona(doctor_id, today_str)
-        system_prompt = build_doctor_agent_prompt(doctor_persona=doctor_persona)
+
+        # Check if an active patient session exists for this device/doctor (persists across standby / Wi-Fi blips)
+        active_pat_state = await get_conversation_state(doctor_id, connection_id, "active_patient")
+        active_pat_name = None
+        active_persona_str = None
+        if isinstance(active_pat_state, dict) and active_pat_state.get("patient_name"):
+            active_pat_name = active_pat_state["patient_name"]
+            active_persona_str = active_pat_state.get("persona_str") or active_pat_state.get("clinical_overview")
+            logger.info(f"🧠 [Active Patient Memory Restored]: '{active_pat_name}' on device {connection_label}")
+
+        system_prompt = build_doctor_agent_prompt(
+            doctor_persona=doctor_persona,
+            patient_name=active_pat_name,
+            persona_str=active_persona_str,
+        )
 
 # Dynamic Voice Biometrics Enrollment Lookup (HALTED / ARCHIVED)
     # Voice signature checking is temporarily bypassed while focusing on core modes/connectivity features.
@@ -3128,6 +3152,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                     upd = getattr(response, "session_resumption_update", None)
                                     if upd is not None and getattr(upd, "resumable", False) and getattr(upd, "new_handle", None):
                                         resume["handle"] = upd.new_handle
+                                        await set_conversation_state(doctor_id, connection_id, "gemini_resume_handle", upd.new_handle, 1800)
                                     if getattr(response, "go_away", None) is not None:
                                         logger.info("⚠️ Gemini GoAway received; session will be resumed on reconnect")
                                         S["gemini_error"] = ConnectionError("Gemini Live requested session restart")
@@ -3445,6 +3470,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         if S.get("conversation_ended"):
             await delete_conversation_state(doctor_id, connection_id, "pending_patient")
             await delete_conversation_state(doctor_id, connection_id, "active_patient")
+            await delete_conversation_state(doctor_id, connection_id, "gemini_resume_handle")
         esp32_task.cancel()
         await asyncio.gather(esp32_task, return_exceptions=True)
         ACTIVE_ESP_CONNECTIONS.pop(connection_id, None)
