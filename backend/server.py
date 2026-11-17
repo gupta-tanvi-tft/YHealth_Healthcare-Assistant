@@ -77,11 +77,11 @@ PERSONA_HARDWARE_TOKEN = os.getenv("PERSONA_HARDWARE_TOKEN", "")
 BYTES_PER_SEC_OUT = 32000.0
 OUT_GAIN = float(os.getenv("GEMINI_OUT_GAIN", "0.46"))       # applied while resampling 24k->16k
 IN_GAIN = float(os.getenv("GEMINI_IN_GAIN", "1.4"))          # mic boost
-MAX_LEAD_S = float(os.getenv("PLAYBACK_MAX_LEAD_S", "1.0"))  # keep extra headroom in the 2 s ESP playback ring
-TARGET_LEAD_S = float(os.getenv("PLAYBACK_TARGET_LEAD_S", "0.6"))
+MAX_LEAD_S = float(os.getenv("PLAYBACK_MAX_LEAD_S", "0.6"))  # keep extra headroom in the 2 s ESP playback ring (matched to 31bb570)
+TARGET_LEAD_S = float(os.getenv("PLAYBACK_TARGET_LEAD_S", "0.3"))
 # Small PCM WebSocket frames avoid a burst filling the ESP32 playback ring.
 # Keep this well below the device's 32 KiB transport buffer.
-AUDIO_WS_CHUNK_BYTES = max(512, min(4096, int(os.getenv("AUDIO_WS_CHUNK_BYTES", "1024"))))
+AUDIO_WS_CHUNK_BYTES = max(512, min(4096, int(os.getenv("AUDIO_WS_CHUNK_BYTES", "2048"))))
 if AUDIO_WS_CHUNK_BYTES & 1:
     AUDIO_WS_CHUNK_BYTES -= 1
 POST_PLAYBACK_MUTE_S = 0.6                                   # ignore mic this long after the speaker finishes
@@ -3430,7 +3430,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                 await ws_send_json({"event": "interrupt_ack"})
                                 continue
 
-                            blocked = S["is_speaking"] or (loop.time() < S.get("mute_until", 0.0)) or (loop.time() < S.get("play_end", 0.0) + POST_PLAYBACK_MUTE_S)
+                            # Matched to 31bb570: don't artificially block doctor's voice for seconds after playback
+                            blocked = S["is_speaking"]
                             if kind == "audio":
                                 S["last_activity"] = loop.time()
                                 if blocked:
