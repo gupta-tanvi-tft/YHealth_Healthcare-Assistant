@@ -15,6 +15,7 @@
 #include "rgb_led_driver.h"
 #include "wakeword_engine.h"
 #include "wifi_connect.h"
+#include "captive_portal.h"
 #include "esp_wifi.h"
 #include <math.h>
 #include <stdbool.h>
@@ -35,6 +36,12 @@ static const char *TAG = "GEMINI_ASSISTANT";
 #define SERVER_PORT CONFIG_ASSISTANT_SERVER_PORT
 #define DOCTOR_ID                                                              \
   CONFIG_ASSISTANT_DOCTOR_ID // ws://SERVER:PORT/ws/live/{DOCTOR_ID}
+
+// --- Dynamic NVS-provisioned server overrides (USB Flash from Dashboard) ---
+static char s_nvs_server_host[128] = {0};  // e.g. "speakermonitoring.yhealth.me"
+static char s_nvs_server_port[8]   = {0};  // e.g. "443" or "8008"
+static bool s_nvs_server_tls       = false;
+static bool s_has_nvs_server       = false;
 
 #define SAMPLE_RATE 16000
 #define CHANNELS 2        // ES7210 hardware input channels
@@ -80,6 +87,8 @@ typedef enum {
 
 static volatile conv_state_t s_conv_state = CONV_STATE_STANDBY;
 static volatile bool s_ws_sleep = false;
+static volatile bool s_pending_wake_event = false;
+static TaskHandle_t s_ws_maintenance_task_handle = NULL;
 static volatile int64_t s_last_speech_time_ms = 0;
 static volatile int64_t s_playback_ended_time_ms = 0;
 static volatile int64_t s_last_audio_rx_ms = 0;
@@ -111,6 +120,7 @@ static bool s_has_odd_byte = false;
 static volatile bool s_boot_anim_done = false;
 static volatile uint64_t s_vol_overlay_until_ms = 0;
 static volatile int s_vol_overlay_level = 0;
+static void show_volume(int vol);
 
 static inline int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -457,6 +467,19 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
   case WEBSOCKET_EVENT_DATA:
     if (data->op_code == 0x01) { // text/JSON
       ESP_LOGI(TAG, "📩 WS: %.*s", data->data_len, data->data_ptr);
+      if (payload_contains(data->data_ptr, data->data_len, "set_volume")) {
+        const char *vptr = strstr(data->data_ptr, "\"volume\"");
+        if (vptr) {
+          int v = 0;
+          if (sscanf(vptr, "\"volume\":%d", &v) >= 1 || sscanf(vptr, "\"volume\": %d", &v) >= 1) {
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            bsp_board_set_volume(v);
+            show_volume(v);
+            ESP_LOGI(TAG, "🔊 [HARDWARE_VOLUME] Volume remotely updated via Dashboard to: %d%%", v);
+          }
+        }
+      }
       if (payload_contains(data->data_ptr, data->data_len,
                            "status_audio_end")) {
         s_status_only_after_playback = true;
@@ -545,15 +568,24 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
   }
 
   char ws_url[256];
-  if (strcmp(SERVER_PORT, "443") == 0) {
+  const char *eff_host = s_has_nvs_server ? s_nvs_server_host : SERVER_IP;
+  const char *eff_port = s_has_nvs_server ? s_nvs_server_port : SERVER_PORT;
+  bool eff_tls = s_has_nvs_server ? s_nvs_server_tls :
+#ifdef CONFIG_ASSISTANT_SERVER_USE_TLS
+                 true;
+#else
+                 false;
+#endif
+
+  if (eff_tls || strcmp(eff_port, "443") == 0) {
     snprintf(ws_url, sizeof(ws_url), "wss://%s/ws/live/%s?device_id=%s&rssi=%d&ssid=%s",
-             SERVER_IP, DOCTOR_ID, s_device_id, rssi, ssid);
-  } else if (strlen(SERVER_PORT) == 0 || strcmp(SERVER_PORT, "80") == 0) {
+             eff_host, DOCTOR_ID, s_device_id, rssi, ssid);
+  } else if (strlen(eff_port) == 0 || strcmp(eff_port, "80") == 0) {
     snprintf(ws_url, sizeof(ws_url), "ws://%s/ws/live/%s?device_id=%s&rssi=%d&ssid=%s",
-             SERVER_IP, DOCTOR_ID, s_device_id, rssi, ssid);
+             eff_host, DOCTOR_ID, s_device_id, rssi, ssid);
   } else {
     snprintf(ws_url, sizeof(ws_url), "ws://%s:%s/ws/live/%s?device_id=%s&rssi=%d&ssid=%s",
-             SERVER_IP, SERVER_PORT, DOCTOR_ID, s_device_id, rssi, ssid);
+             eff_host, eff_port, DOCTOR_ID, s_device_id, rssi, ssid);
   }
 
   ESP_LOGI(TAG, "Connecting WebSocket: %s", ws_url);
@@ -563,8 +595,8 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
       .buffer_size = 32768,
       .reconnect_timeout_ms = 1500,
       .network_timeout_ms = 8000,
-      .ping_interval_sec = 10,
-      .pingpong_timeout_sec = 25,
+      .ping_interval_sec = 0,
+      .pingpong_timeout_sec = 0,
       .crt_bundle_attach = esp_crt_bundle_attach,
       .skip_cert_common_name_check = true,
       .headers = "ngrok-skip-browser-warning: 1\r\nUser-Agent: ESP32\r\n",
@@ -590,8 +622,7 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
   }
   for (int i = 0; !s_ws_connected && i < 100; i++)
     vTaskDelay(pdMS_TO_TICKS(15));
-  esp_err_t result = (s_ws_connected && s_persistent_ws_client &&
-                      esp_websocket_client_is_connected(s_persistent_ws_client))
+  esp_err_t result = (s_ws_connected && s_persistent_ws_client)
                          ? ESP_OK
                          : ESP_ERR_TIMEOUT;
   xSemaphoreGive(s_ws_connect_mutex);
@@ -599,8 +630,7 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
 }
 
 static inline bool ws_ready(void) {
-  return s_ws_connected && s_persistent_ws_client &&
-         esp_websocket_client_is_connected(s_persistent_ws_client);
+  return s_ws_connected && (s_persistent_ws_client != NULL);
 }
 
 static void maybe_send_pending_interrupt(void) {
@@ -632,11 +662,18 @@ static void maybe_send_pending_interrupt(void) {
 
 static void enter_sleep_mode(const char *reason) {
   ESP_LOGI(TAG,
-           "🛑 Entering SLEEP mode (%s): disconnecting WebSocket, RED light.",
-           reason);
+           "🛑 Entering SLEEP mode (%s): notifying backend & entering local standby.",
+           reason ? reason : "unspecified");
   s_ws_sleep = true;
   s_conv_state = CONV_STATE_SLEEP;
+  update_led_state(CONV_STATE_SLEEP);
   wakeword_reset();
+  if (s_persistent_ws_client && s_ws_connected) {
+    char sleep_msg[96];
+    snprintf(sleep_msg, sizeof(sleep_msg), "{\"type\":\"device_sleep\",\"reason\":\"%s\"}", reason ? reason : "standby");
+    esp_websocket_client_send_text(s_persistent_ws_client, sleep_msg, strlen(sleep_msg), pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
   if (s_persistent_ws_client) {
     esp_websocket_client_stop(s_persistent_ws_client);
     esp_websocket_client_destroy(s_persistent_ws_client);
@@ -648,14 +685,16 @@ static void enter_sleep_mode(const char *reason) {
 
 static void exit_sleep_mode(const char *reason) {
   ESP_LOGI(TAG,
-           "🟢 Exiting SLEEP mode (%s): reconnecting WebSocket, switching to "
+           "🟢 Exiting SLEEP mode (%s): triggering background WebSocket reconnect, switching to "
            "LISTENING.",
            reason);
   s_ws_sleep = false;
   s_last_speech_time_ms = now_ms();
   s_conv_state = CONV_STATE_LISTENING;
   update_led_state(CONV_STATE_LISTENING);
-  ensure_websocket_connected(&s_playback_ctx);
+  if (s_ws_maintenance_task_handle) {
+    xTaskNotifyGive(s_ws_maintenance_task_handle);
+  }
 }
 
 // Keep network recovery off the real-time microphone task. A reconnect can
@@ -664,12 +703,8 @@ static void exit_sleep_mode(const char *reason) {
 static void websocket_maintenance_task(void *pvParameters) {
   int64_t last_warning_ms = 0;
   while (1) {
-    if (s_ws_sleep) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-    if (ws_ready()) {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+    if (s_ws_sleep || ws_ready()) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
       continue;
     }
 
@@ -681,7 +716,7 @@ static void websocket_maintenance_task(void *pvParameters) {
                esp_err_to_name(err));
       last_warning_ms = now_ms();
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
   }
 }
 
@@ -739,9 +774,20 @@ static void continuous_mic_stream_task(void *pvParameters) {
   for (int f = 0; f < 5; f++) // flush stale ADC data
     esp_get_feed_data(true, (int16_t *)raw_chunk, chunk_raw_bytes);
 
-  int16_t chunk_mono[CHUNK_SAMPLES];
-  int16_t preroll[CHUNK_SAMPLES * 2] = {
-      0};             // last 2 chunks (64 ms) so the first consonant isn't lost
+  int16_t *chunk_mono = (int16_t *)malloc(CHUNK_SAMPLES * sizeof(int16_t));
+  int16_t *preroll = (int16_t *)calloc(CHUNK_SAMPLES * 2, sizeof(int16_t));
+#define PRECONN_CHUNKS 12
+  int16_t (*preconn_buf)[CHUNK_SAMPLES] = (int16_t (*)[CHUNK_SAMPLES])calloc(PRECONN_CHUNKS * CHUNK_SAMPLES, sizeof(int16_t));
+  int preconn_count = 0;
+  if (!chunk_mono || !preroll || !preconn_buf) {
+    ESP_LOGE(TAG, "Failed to allocate mic processing buffers!");
+    if (raw_chunk) free(raw_chunk);
+    if (chunk_mono) free(chunk_mono);
+    if (preroll) free(preroll);
+    if (preconn_buf) free(preconn_buf);
+    vTaskDelete(NULL);
+    return;
+  }
   int pre_chunks = 0; // how many of those are valid (0..2)
   int wake_hits = 0;
 
@@ -799,17 +845,14 @@ static void continuous_mic_stream_task(void *pvParameters) {
       bool ww_hit = wakeword_feed_samples(chunk_mono, chunk_samples, &ww_res);
       if (ww_hit) {
         const char *trigger_name = ww_res.keyword;
-        ESP_LOGI(TAG, "🎯 Wakeword detected in SLEEP: '%s'! Waking up and switching to LISTENING...",
+        ESP_LOGI(TAG, "🎯 Wakeword detected in SLEEP: '%s'! Waking up instantly and switching to LISTENING...",
                  trigger_name);
+        s_pending_wake_event = true;
         exit_sleep_mode(trigger_name);
         speech_accum_ms = chunk_duration_ms * WAKE_CONFIRM_CHUNKS;
         silence_accum_ms = 0;
         pre_chunks = wake_hits = 0;
-        if (ws_ready()) {
-          const char *wake_evt = "{\"event\":\"user_utterance\",\"text\":\"Hello assistant\"}";
-          esp_websocket_client_send_text(s_persistent_ws_client, wake_evt,
-                                         strlen(wake_evt), pdMS_TO_TICKS(500));
-        }
+        preconn_count = 0;
       } else {
         wake_hits = 0;
       }
@@ -831,10 +874,8 @@ static void continuous_mic_stream_task(void *pvParameters) {
 
       wakeword_result_t ww_res;
       bool ww_hit = wakeword_feed_samples(chunk_mono, chunk_samples, &ww_res);
-      if (ww_hit || (rms >= VAD_WAKE_THRESHOLD_RMS &&
-                     ++wake_hits >= WAKE_CONFIRM_CHUNKS)) {
-        ESP_LOGI(TAG, "🗣️ Session activated (%s, RMS %.1f)",
-                 ww_hit ? ww_res.keyword : "Voice Activity", rms);
+      if (ww_hit) {
+        ESP_LOGI(TAG, "🎯 Wakeword confirmed in STANDBY: '%s'. Activating session.", ww_res.keyword);
         if (!ws_ready()) {
           // Reconnect runs in websocket_maintenance_task; never block the
           // real-time mic task while it repairs the connection.
@@ -877,22 +918,42 @@ static void continuous_mic_stream_task(void *pvParameters) {
 
     // 3. LISTENING: stream to Gemini until the user stops talking
     if (s_conv_state == CONV_STATE_LISTENING) {
-      if (rms >= VAD_ACTIVE_THRESHOLD_RMS) {
+      if (rms >= VAD_ACTIVE_THRESHOLD_RMS || speech_accum_ms > 0) {
         s_last_speech_time_ms = t;
-        speech_accum_ms += chunk_duration_ms;
-        silence_accum_ms = 0;
-        if (ws_ready() && esp_websocket_client_send_bin(
-                              s_persistent_ws_client, (const char *)chunk_mono,
-                              CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0)
-          ESP_LOGW(TAG, "Failed to stream PCM frame!");
-      } else if (speech_accum_ms > 0) {
-        // Was talking, now quiet — keep streaming the silence so Gemini's VAD
-        // sees the pause.
-        silence_accum_ms += chunk_duration_ms;
-        if (ws_ready())
-          esp_websocket_client_send_bin(s_persistent_ws_client,
-                                        (const char *)chunk_mono,
-                                        CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
+        if (rms >= VAD_ACTIVE_THRESHOLD_RMS) {
+          speech_accum_ms += chunk_duration_ms;
+          silence_accum_ms = 0;
+        } else {
+          silence_accum_ms += chunk_duration_ms;
+        }
+
+        if (ws_ready()) {
+          if (s_pending_wake_event) {
+            s_pending_wake_event = false;
+            const char *wake_evt = "{\"event\":\"user_utterance\",\"text\":\"Hello assistant\"}";
+            esp_websocket_client_send_text(s_persistent_ws_client, wake_evt,
+                                           strlen(wake_evt), pdMS_TO_TICKS(300));
+            ESP_LOGI(TAG, "📤 Dispatched wake utterance event to Gemini");
+          }
+          if (preconn_count > 0) {
+            for (int p = 0; p < preconn_count; p++) {
+              esp_websocket_client_send_bin(s_persistent_ws_client, (const char *)preconn_buf[p],
+                                            CHUNK_MONO_BYTES, pdMS_TO_TICKS(500));
+            }
+            ESP_LOGI(TAG, "📤 Flushed %d buffered speech chunks post-connect", preconn_count);
+            preconn_count = 0;
+          }
+          if (esp_websocket_client_send_bin(
+                  s_persistent_ws_client, (const char *)chunk_mono,
+                  CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0) {
+            ESP_LOGW(TAG, "Failed to stream PCM frame!");
+          }
+        } else {
+          // Socket connecting in background on Core 0: buffer chunks so speech is not lost
+          if (preconn_count < PRECONN_CHUNKS) {
+            memcpy(preconn_buf[preconn_count++], chunk_mono, CHUNK_MONO_BYTES);
+          }
+        }
 
         if (silence_accum_ms >= SILENCE_TIMEOUT_MS) {
           if (speech_accum_ms >= MIN_SPEECH_DURATION_MS) {
@@ -914,12 +975,14 @@ static void continuous_mic_stream_task(void *pvParameters) {
                      speech_accum_ms);
           }
           speech_accum_ms = silence_accum_ms = 0;
+          preconn_count = 0;
         }
       } else if ((t - s_last_speech_time_ms) >
                  (IDLE_STANDBY_TIMEOUT_S * 1000)) {
         ESP_LOGI(TAG, "⏳ Idle %d s. Back to Standby.", IDLE_STANDBY_TIMEOUT_S);
         s_conv_state = CONV_STATE_STANDBY;
         update_led_state(CONV_STATE_STANDBY);
+        preconn_count = 0;
       }
       continue;
     }
@@ -1006,13 +1069,26 @@ static void gpio_button_task(void *pvParameters) {
   gpio_config(&io_conf);
 
   bool prev_boot_state = 1;
+  uint32_t boot_press_start_ms = 0;
+  bool boot_long_handled = false;
   uint16_t prev_tca_val = 0xFFFF;
 
   while (1) {
     bool boot_pressed = (gpio_get_level(GPIO_BTN_BOOT) == 0);
-    if (boot_pressed && prev_boot_state == 1) {
-      toggle_conversation("BOOT button");
-      vTaskDelay(pdMS_TO_TICKS(400));
+    if (boot_pressed) {
+      if (prev_boot_state == 1) {
+        boot_press_start_ms = now_ms();
+        boot_long_handled = false;
+      } else if (!boot_long_handled && (now_ms() - boot_press_start_ms >= 3000)) {
+        boot_long_handled = true;
+        ESP_LOGI(TAG, "🔘 [SETUP_MODE] BOOT button held for 3s! Launching SoftAP Captive Portal: 'YHealth-Setup'...");
+        rgb_led_set_all(0, 80, 200); // Blue indicator for setup mode
+        captive_portal_start(NULL);
+      }
+    } else {
+      if (prev_boot_state == 0 && !boot_long_handled) {
+        toggle_conversation("BOOT button");
+      }
     }
     prev_boot_state = !boot_pressed;
 
@@ -1039,8 +1115,11 @@ static void gpio_button_task(void *pvParameters) {
         ESP_LOGI(TAG, "🔉 Volume DOWN: %d%%", v);
         show_volume(v);
       }
-      if ((port1 & 0x08) == 0 && (prev_port1 & 0x08) != 0) // Button 3: toggle
-        toggle_conversation("Waveshare button 3");
+      if ((port1 & 0x08) == 0 && (prev_port1 & 0x08) != 0) { // Button 4: K3/SET (User-defined key)
+        ESP_LOGI(TAG, "🔘 [WIFI_PROVISION] User Button 4 (K3/SET) pressed! Launching SoftAP Captive Portal: 'YHealth-Setup'...");
+        rgb_led_set_all(0, 80, 200); // Blue indicator for SoftAP mode
+        captive_portal_start(NULL);
+      }
 
       prev_tca_val = tca_val;
     }
@@ -1048,9 +1127,10 @@ static void gpio_button_task(void *pvParameters) {
   }
 }
 
-// Background task listening for USB Serial commands from Fleet Dashboard
+// Background task listening for USB Serial commands from Fleet Dashboard / WebSerial
 static void usb_serial_listener_task(void *pvParameters) {
-  char line[128];
+  char line[512];
+  ESP_LOGI(TAG, "⚡ USB Serial Listener active. Listening for WebSerial commands (SET_WIFI, SET_SERVER, GET_DEVICE_INFO)...");
   while (1) {
     if (fgets(line, sizeof(line), stdin) != NULL) {
       char ssid[33] = {0};
@@ -1063,11 +1143,91 @@ static void usb_serial_listener_task(void *pvParameters) {
           nvs_set_str(nvs_h, "wifi_pass", pass);
           nvs_commit(nvs_h);
           nvs_close(nvs_h);
-          printf("OK:WIFI_SAVED\n");
+          printf("\r\nOK:WIFI_SAVED:SSID=%s\r\n", ssid);
           fflush(stdout);
           vTaskDelay(pdMS_TO_TICKS(600));
           esp_restart();
+        } else {
+          printf("\r\nERR:NVS_OPEN_FAILED\r\n");
+          fflush(stdout);
         }
+      } else if (strncmp(line, "SET_SERVER:", 11) == 0) {
+        // Format: SET_SERVER:<host>:<port>
+        // Example: SET_SERVER:speakermonitoring.yhealth.me:443
+        char host[128] = {0};
+        char port[8] = "443";
+        if (sscanf(line + 11, "%127[^:]:%7[^\r\n]", host, port) >= 1 && strlen(host) > 0) {
+          ESP_LOGI(TAG, "⚡ Received server config via USB: Host='%s' Port='%s'", host, port);
+          nvs_handle_t nvs_h;
+          if (nvs_open("storage", NVS_READWRITE, &nvs_h) == ESP_OK) {
+            nvs_set_str(nvs_h, "server_host", host);
+            nvs_set_str(nvs_h, "server_port", port);
+            nvs_commit(nvs_h);
+            nvs_close(nvs_h);
+            printf("\r\nOK:SERVER_SAVED:HOST=%s:PORT=%s\r\n", host, port);
+            fflush(stdout);
+          } else {
+            printf("\r\nERR:NVS_OPEN_FAILED\r\n");
+            fflush(stdout);
+          }
+        }
+      } else if (strncmp(line, "PROVISION:", 10) == 0) {
+        // All-in-one provisioning: PROVISION:<ssid>:<pass>:<server_host>:<server_port>
+        // Example: PROVISION:HomeWiFi:secret123:speakermonitoring.yhealth.me:443
+        char p_ssid[33] = {0};
+        char p_pass[65] = {0};
+        char p_host[128] = {0};
+        char p_port[8] = "443";
+        char *ptr = line + 10;
+        char *c1 = strchr(ptr, ':');
+        if (c1 != NULL) {
+          int s_len = (int)(c1 - ptr);
+          if (s_len > 32) s_len = 32;
+          strncpy(p_ssid, ptr, s_len);
+          char *c2 = strchr(c1 + 1, ':');
+          if (c2 != NULL) {
+            int p_len = (int)(c2 - (c1 + 1));
+            if (p_len > 64) p_len = 64;
+            strncpy(p_pass, c1 + 1, p_len);
+            char *c3 = strchr(c2 + 1, ':');
+            if (c3 != NULL) {
+              int h_len = (int)(c3 - (c2 + 1));
+              if (h_len > 127) h_len = 127;
+              strncpy(p_host, c2 + 1, h_len);
+              sscanf(c3 + 1, "%7[^\r\n]", p_port);
+            } else {
+              sscanf(c2 + 1, "%127[^\r\n]", p_host);
+            }
+          }
+        }
+        if (strlen(p_ssid) > 0 && strlen(p_host) > 0) {
+          ESP_LOGI(TAG, "⚡ Full USB Provision: SSID='%s' Server='%s:%s'", p_ssid, p_host, p_port);
+          nvs_handle_t nvs_h;
+          if (nvs_open("storage", NVS_READWRITE, &nvs_h) == ESP_OK) {
+            nvs_set_str(nvs_h, "wifi_ssid", p_ssid);
+            nvs_set_str(nvs_h, "wifi_pass", p_pass);
+            nvs_set_str(nvs_h, "server_host", p_host);
+            nvs_set_str(nvs_h, "server_port", strlen(p_port) > 0 ? p_port : "443");
+            nvs_commit(nvs_h);
+            nvs_close(nvs_h);
+            printf("\r\nOK:PROVISIONED:SSID=%s:HOST=%s:PORT=%s\r\n", p_ssid, p_host, p_port);
+            fflush(stdout);
+            vTaskDelay(pdMS_TO_TICKS(600));
+            esp_restart();
+          } else {
+            printf("\r\nERR:NVS_OPEN_FAILED\r\n");
+            fflush(stdout);
+          }
+        }
+      } else if (strstr(line, "GET_DEVICE_INFO") != NULL || strstr(line, "GET_MAC") != NULL) {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        // Include current server config in device info
+        const char *cur_host = s_has_nvs_server ? s_nvs_server_host : SERVER_IP;
+        const char *cur_port = s_has_nvs_server ? s_nvs_server_port : SERVER_PORT;
+        printf("DEVICE_INFO:{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"device_id\":\"%s\",\"server_host\":\"%s\",\"server_port\":\"%s\"}\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], s_device_id, cur_host, cur_port);
+        fflush(stdout);
       }
     }
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1128,8 +1288,8 @@ void app_main(void) {
                           10, NULL, 1);
   xTaskCreatePinnedToCore(gpio_button_task, "gpio_button_task", 6144, NULL, 4,
                           NULL, 0);
-  xTaskCreatePinnedToCore(usb_serial_listener_task, "usb_serial_task", 3072,
-                          NULL, 2, NULL, 0);
+  // USB serial listener task with safe 5120-byte stack for WebSerial Wi-Fi provisioning & identity detection
+  xTaskCreatePinnedToCore(usb_serial_listener_task, "usb_serial_task", 5120, NULL, 2, NULL, 0);
 
   ESP_LOGI(TAG, "Connecting to Wi-Fi...");
   if (wifi_init_sta() != ESP_OK) {
@@ -1139,6 +1299,26 @@ void app_main(void) {
   }
   rgb_led_set_all_hex(LED_COLOR_WIFI_OK);
   vTaskDelay(pdMS_TO_TICKS(400));
+
+  // --- Load USB-provisioned server config from NVS (overrides Kconfig defaults) ---
+  {
+    nvs_handle_t nvs_h;
+    if (nvs_open("storage", NVS_READONLY, &nvs_h) == ESP_OK) {
+      size_t host_len = sizeof(s_nvs_server_host);
+      size_t port_len = sizeof(s_nvs_server_port);
+      if (nvs_get_str(nvs_h, "server_host", s_nvs_server_host, &host_len) == ESP_OK &&
+          strlen(s_nvs_server_host) > 0) {
+        s_has_nvs_server = true;
+        if (nvs_get_str(nvs_h, "server_port", s_nvs_server_port, &port_len) != ESP_OK) {
+          strncpy(s_nvs_server_port, "443", sizeof(s_nvs_server_port));
+        }
+        s_nvs_server_tls = (strcmp(s_nvs_server_port, "443") == 0);
+        ESP_LOGI(TAG, "📡 Loaded server config from NVS (USB Provisioned): Host='%s' Port='%s' TLS=%s",
+                 s_nvs_server_host, s_nvs_server_port, s_nvs_server_tls ? "YES" : "NO");
+      }
+      nvs_close(nvs_h);
+    }
+  }
 
   ESP_LOGI(TAG, "Opening persistent WebSocket at boot...");
   ensure_websocket_connected(&s_playback_ctx);
@@ -1154,12 +1334,12 @@ void app_main(void) {
   update_led_state(s_conv_state);
 
   xTaskCreatePinnedToCore(websocket_maintenance_task, "ws_maintenance_task",
-                          4096, NULL, 4, NULL, 0);
+                          4096, NULL, 4, &s_ws_maintenance_task_handle, 0);
 
   xTaskCreatePinnedToCore(heartbeat_task, "heartbeat_task", 4096, NULL, 3,
                           NULL, 0);
 
-  xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 6144,
+  xTaskCreatePinnedToCore(continuous_mic_stream_task, "mic_stream_task", 10240,
                           NULL, 9, NULL, 1);
 
   ESP_LOGI(TAG, "✅ Free heap after all tasks: %lu bytes",
