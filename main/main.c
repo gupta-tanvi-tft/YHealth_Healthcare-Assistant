@@ -54,12 +54,11 @@ static bool s_has_nvs_server       = false;
   2 // need 2 loud chunks (~64 ms) so clicks don't wake us
 #define MIN_SPEECH_DURATION_MS 200 // ignore blips shorter than this
 #define SILENCE_TIMEOUT_MS                                                     \
-  650 // trailing silence => utterance finished (saves audio tokens & low
-      // latency)
-#define IDLE_STANDBY_TIMEOUT_S 30 // inactivity => Standby
+  350 // trailing silence => utterance finished (low latency 350ms)
+#define IDLE_STANDBY_TIMEOUT_S 120 // 2 minutes inactivity => Sleep / Standby
 #define INACTIVITY_SLEEP_TIMEOUT_S                                             \
   120 // 2 minutes (120 s) => Disconnect & Sleep
-#define GEMINI_RESPONSE_TIMEOUT_MS 4000
+#define GEMINI_RESPONSE_TIMEOUT_MS 15000 // 15s to allow tool-call execution
 #define MIC_HOLDOFF_AFTER_PLAYBACK_MS                                          \
   400 // keep mic muted after speaker stops (room echo tail)
 #define BARGE_IN_THRESHOLD_RMS                                                 \
@@ -69,7 +68,7 @@ static bool s_has_nvs_server       = false;
 // Playback
 #define PLAYBACK_RB_SIZE 65536 // 2.0 s of 16 kHz mono s16
 #define PLAYBACK_PREBUFFER_BYTES                                               \
-  6400 // 200 ms cushion before (re)starting playback
+  3200 // 100 ms cushion before (re)starting playback for fast response
 #define PLAYBACK_STALL_TIMEOUT_MS 6000 // tolerate tool-call gaps mid-turn
 #define PLAYBACK_TAIL_FLUSH_MS                                                 \
   250 // play a short tail even if turn_complete is late
@@ -988,9 +987,9 @@ static void continuous_mic_stream_task(void *pvParameters) {
     }
 
     // 4. THINKING: wait for audio / turn_complete, but keep listening if doctor
-    // speaks!
+    // speaks deliberately (require RMS >= 160.0 to prevent room noise from aborting thinking)!
     if (s_conv_state == CONV_STATE_THINKING) {
-      if (rms >= VAD_ACTIVE_THRESHOLD_RMS) {
+      if (rms >= 160.0f) {
         ESP_LOGI(TAG,
                  "🗣️ Doctor speaking (RMS %.1f) during thinking. Resuming "
                  "active listening.",

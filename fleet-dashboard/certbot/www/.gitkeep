@@ -1,0 +1,2 @@
+# ACME challenge webroot directory.
+# Mounted into Nginx for Certbot verification.

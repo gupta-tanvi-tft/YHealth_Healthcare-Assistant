@@ -1,0 +1,27 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: yhealth-fleet-dashboard
+    restart: always
+    ports:
+      - "0.0.0.0:8010:8010"
+    environment:
+      - DASHBOARD_MODE=production
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./backend/fleet_db.json:/app/backend/fleet_db.json
+      - ./backend/users_db.json:/app/backend/users_db.json
+    networks:
+      - fleet-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/api/speakers"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  fleet-net:
+    driver: bridge

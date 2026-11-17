@@ -2,217 +2,723 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>YHealth Speaker Fleet - Printable Hardware QR Sticker Badges</title>
+  <title>YHealth Hardware QR Stickers (1cm Neat Specification)</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
       background: #f1f5f9;
       color: #0f172a;
-      padding: 30px;
+      padding: 28px;
     }
-    .sheet-title {
-      text-align: center;
-      margin-bottom: 25px;
-    }
-    .sheet-title h1 {
-      font-size: 24px;
-      font-weight: 800;
-      color: #0f172a;
-    }
-    .sheet-title p {
-      color: #64748b;
-      font-size: 13px;
-      margin-top: 5px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 20px;
-      max-width: 1200px;
-      margin: 0 auto;
-    }
-    .sticker-card {
+
+    .control-header {
       background: #ffffff;
-      border: 1.5px dashed #cbd5e1;
+      border: 1px solid #e2e8f0;
       border-radius: 12px;
-      padding: 18px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      box-shadow: 0 4px 10px rgba(0,0,0,0.04);
-      page-break-inside: avoid;
-    }
-    .card-header {
-      width: 100%;
+      padding: 18px 24px;
+      max-width: 980px;
+      margin: 0 auto 24px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding-top: 6px;
-      margin-bottom: 12px;
+      flex-wrap: wrap;
+      gap: 16px;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.04);
     }
-    .role-badge {
-      font-size: 9.5px;
+    .control-header h1 {
+      font-size: 19px;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+      color: #0f172a;
+    }
+    .control-header p {
+      font-size: 12.5px;
+      color: #64748b;
+      margin-top: 3px;
+    }
+
+    .ruler-checker {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      color: #334155;
+      font-weight: 600;
+    }
+    .ruler-10mm {
+      width: 1cm;
+      height: 7px;
+      background: #0284c7;
+      border-left: 2px solid #0369a1;
+      border-right: 2px solid #0369a1;
+      display: inline-block;
+    }
+
+    .print-btn {
+      background: #0f172a;
+      color: #ffffff;
+      font-weight: 700;
+      font-size: 13px;
+      padding: 9px 20px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 2px 8px rgba(15, 23, 42, 0.25);
+      transition: all 0.15s ease;
+    }
+    .print-btn:hover {
+      background: #1e293b;
+    }
+
+    .pdf-link {
+      color: #0284c7;
+      text-decoration: none;
+      font-size: 12.5px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .pdf-link:hover {
+      text-decoration: underline;
+    }
+
+    /* A4 Printable Sheet */
+    .sheet {
+      background: #ffffff;
+      width: 210mm;
+      min-height: 297mm;
+      margin: 0 auto;
+      padding: 14mm 12mm;
+      box-shadow: 0 0 24px rgba(0,0,0,0.07);
+      border-radius: 6px;
+    }
+
+    .sec-header {
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #475569;
+      border-bottom: 1.5px solid #e2e8f0;
+      padding-bottom: 6px;
+      margin-bottom: 14px;
+    }
+
+    /* EXACT 1.0 CM (10.0 MM) VECTOR QR IMAGE */
+    .qr-exact-1cm {
+      width: 1.0cm !important;
+      height: 1.0cm !important;
+      min-width: 1.0cm !important;
+      min-height: 1.0cm !important;
+      max-width: 1.0cm !important;
+      max-height: 1.0cm !important;
+      display: block;
+    }
+
+    /* FORMAT A: Clean Chassis Sticker (44mm x 16mm) */
+    .chassis-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 4mm;
+      margin-bottom: 24px;
+    }
+
+    .chassis-badge {
+      width: 44mm;
+      height: 16mm;
+      border: 1px dashed #94a3b8;
+      border-radius: 4px;
+      background: #ffffff;
+      padding: 2mm 2.5mm;
+      display: flex;
+      align-items: center;
+      gap: 2.5mm;
+      page-break-inside: avoid;
+    }
+
+    .qr-box {
+      width: 1cm;
+      height: 1cm;
+      flex-shrink: 0;
+      background: #ffffff;
+      display: grid;
+      place-items: center;
+    }
+
+    .text-box {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      line-height: 1.1;
+    }
+
+    .header-line {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1px;
+    }
+    .brand-tag {
+      font-size: 5pt;
+      font-weight: 900;
+      color: #0f172a;
+      letter-spacing: 0.04em;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .dot {
+      width: 3px;
+      height: 3px;
+      border-radius: 50%;
+      background: #0284c7;
+      display: inline-block;
+    }
+    .role-pill {
+      font-size: 4.2pt;
       font-weight: 800;
       color: #ffffff;
-      padding: 3px 8px;
-      border-radius: 4px;
-      letter-spacing: 0.04em;
+      padding: 0.8px 3px;
+      border-radius: 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
     }
-    .device-id {
-      font-size: 16px;
+
+    .device-title {
+      font-size: 9.5pt;
       font-weight: 900;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       color: #0f172a;
+      letter-spacing: -0.02em;
     }
-    .qr-container {
-      background: #ffffff;
-      padding: 8px;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      margin-bottom: 12px;
-    }
-    .card-details {
-      width: 100%;
-      text-align: left;
-      font-size: 11.5px;
-      line-height: 1.5;
-    }
-    .person-name {
-      font-size: 14px;
-      font-weight: 700;
-      color: #0f172a;
-      margin-bottom: 4px;
-    }
-    .info-row {
-      color: #475569;
-    }
-    .mono {
+
+    .mac-text {
+      font-size: 5pt;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-weight: 600;
-      color: #1e293b;
-    }
-    .card-footer {
-      margin-top: 10px;
-      font-size: 9px;
-      color: #94a3b8;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
+      color: #334155;
       font-weight: 700;
-      text-align: center;
-      border-top: 1px solid #f1f5f9;
-      padding-top: 8px;
-      width: 100%;
+      white-space: nowrap;
+      letter-spacing: 0.01em;
     }
+
+    .model-text {
+      font-size: 4pt;
+      color: #94a3b8;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      margin-top: 1px;
+    }
+
+    /* FORMAT B: Ultra-Micro QR Stickers (13mm x 18mm) */
+    .micro-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4mm;
+    }
+
+    .micro-badge {
+      width: 14mm;
+      height: 18mm;
+      border: 1px dashed #cbd5e1;
+      border-radius: 3px;
+      padding: 1.5mm;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #ffffff;
+      page-break-inside: avoid;
+    }
+
+    .micro-title {
+      font-size: 6.5pt;
+      font-weight: 900;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: #0f172a;
+      margin-top: 1.5mm;
+      text-align: center;
+    }
+
     @media print {
-      body { background: #ffffff; padding: 0; }
-      .sheet-title { display: none; }
-      .sticker-card { box-shadow: none; border: 1px dashed #94a3b8; }
+      body {
+        background: #ffffff;
+        padding: 0;
+      }
+      .control-header {
+        display: none !important;
+      }
+      .sheet {
+        box-shadow: none;
+        padding: 8mm 6mm;
+        margin: 0;
+        width: 100%;
+      }
+      .chassis-badge {
+        border: 0.6px dashed #475569;
+      }
+      .micro-badge {
+        border: 0.6px dashed #475569;
+      }
+      @page {
+        size: A4 portrait;
+        margin: 8mm;
+      }
     }
   </style>
 </head>
 <body>
-  <div class="sheet-title">
-    <h1>YHealth Smart Healthcare Speaker Fleet (5 Units)</h1>
-    <p>Printable Hardware Pairing & Webcam Provisioning Badges &bull; Cut along dashed borders</p>
+
+  <div class="control-header">
+    <div>
+      <h1>🏷️ YHealth Smart Speaker Hardware Labels (1cm Precision)</h1>
+      <p>Clean Vector QR Codes &bull; Calibrated to exact 10mm &bull; Pure vector rendering</p>
+    </div>
+    <div style="display: flex; align-items: center; gap: 14px;">
+      <div class="ruler-checker">
+        <span>Calibration:</span>
+        <div class="ruler-10mm"></div>
+        <span>= 1.0 cm</span>
+      </div>
+      <a href="YHealth_1cm_Speaker_Stickers.pdf" target="_blank" class="pdf-link">
+        📄 Download PDF
+      </a>
+      <button class="print-btn" onclick="window.print()">
+        🖨️ Print Labels
+      </button>
+    </div>
   </div>
-  <div class="grid">
-    
-    <div class="sticker-card">
-      <div class="card-header" style="border-top: 4px solid #10b981;">
-        <span class="role-badge" style="background: #10b981;">DOCTOR CLINICAL UNIT</span>
-        <span class="device-id">SPK-01</span>
+
+  <div class="sheet">
+    <div class="sec-header">
+      FORMAT A: Chassis Hardware Label (44mm × 16mm) &bull; 1.0 cm Vector QR + Device ID & MAC
+    </div>
+    <div class="chassis-grid">
+      
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-01_1cm.svg" alt="SPK-01" class="qr-exact-1cm" />
       </div>
-      <div class="qr-container">
-        <img src="SPK-01_QR.png" alt="QR Code for SPK-01" width="220" height="220" />
-      </div>
-      <div class="card-details">
-        <div class="person-name">Dr. Brij Mohan Makkar</div>
-        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:70</span></div>
-        <div class="info-row"><b>Assigned ID:</b> <span class="mono">6789ebb61a093d60fa691c39</span></div>
-        <div class="info-row"><b>Location:</b> Dr. Makkar's Clinic (Consultation Room 1)</div>
-      </div>
-      <div class="card-footer">
-        Scan via Dashboard Webcam for Zero-Touch Pairing
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-01</div>
+        <div class="mac-text">A0:F2:62:E3:4C:70</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
       </div>
     </div>
     
-    <div class="sticker-card">
-      <div class="card-header" style="border-top: 4px solid #10b981;">
-        <span class="role-badge" style="background: #10b981;">DOCTOR CLINICAL UNIT</span>
-        <span class="device-id">SPK-02</span>
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-02_1cm.svg" alt="SPK-02" class="qr-exact-1cm" />
       </div>
-      <div class="qr-container">
-        <img src="SPK-02_QR.png" alt="QR Code for SPK-02" width="220" height="220" />
-      </div>
-      <div class="card-details">
-        <div class="person-name">Dr. Brij Mohan Makkar (Suite 2 / Home)</div>
-        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:71</span></div>
-        <div class="info-row"><b>Assigned ID:</b> <span class="mono">6789ebb61a093d60fa691c39</span></div>
-        <div class="info-row"><b>Location:</b> Consultation Suite 2 / Home Office</div>
-      </div>
-      <div class="card-footer">
-        Scan via Dashboard Webcam for Zero-Touch Pairing
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-02</div>
+        <div class="mac-text">28:84:85:B2:BC:B8</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
       </div>
     </div>
     
-    <div class="sticker-card">
-      <div class="card-header" style="border-top: 4px solid #0ea5e9;">
-        <span class="role-badge" style="background: #0ea5e9;">PATIENT BEDSIDE STATION</span>
-        <span class="device-id">SPK-03</span>
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-03_1cm.svg" alt="SPK-03" class="qr-exact-1cm" />
       </div>
-      <div class="qr-container">
-        <img src="SPK-03_QR.png" alt="QR Code for SPK-03" width="220" height="220" />
-      </div>
-      <div class="card-details">
-        <div class="person-name">Vijay Gupta Sir</div>
-        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:72</span></div>
-        <div class="info-row"><b>Assigned ID:</b> <span class="mono">PAT-VIJAY-01</span></div>
-        <div class="info-row"><b>Location:</b> Home Bedside Station (Primary)</div>
-      </div>
-      <div class="card-footer">
-        Scan via Dashboard Webcam for Zero-Touch Pairing
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-03</div>
+        <div class="mac-text">28:84:85:B2:BB:C8</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
       </div>
     </div>
     
-    <div class="sticker-card">
-      <div class="card-header" style="border-top: 4px solid #0ea5e9;">
-        <span class="role-badge" style="background: #0ea5e9;">PATIENT BEDSIDE STATION</span>
-        <span class="device-id">SPK-04</span>
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-04_1cm.svg" alt="SPK-04" class="qr-exact-1cm" />
       </div>
-      <div class="qr-container">
-        <img src="SPK-04_QR.png" alt="QR Code for SPK-04" width="220" height="220" />
-      </div>
-      <div class="card-details">
-        <div class="person-name">Internal Lab Testing Unit</div>
-        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:73</span></div>
-        <div class="info-row"><b>Assigned ID:</b> <span class="mono">PAT-TEST-01</span></div>
-        <div class="info-row"><b>Location:</b> Hardware Lab Testbench 1</div>
-      </div>
-      <div class="card-footer">
-        Scan via Dashboard Webcam for Zero-Touch Pairing
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-04</div>
+        <div class="mac-text">28:84:85:B2:BD:BC</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
       </div>
     </div>
     
-    <div class="sticker-card">
-      <div class="card-header" style="border-top: 4px solid #0ea5e9;">
-        <span class="role-badge" style="background: #0ea5e9;">PATIENT BEDSIDE STATION</span>
-        <span class="device-id">SPK-05</span>
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-05_1cm.svg" alt="SPK-05" class="qr-exact-1cm" />
       </div>
-      <div class="qr-container">
-        <img src="SPK-05_QR.png" alt="QR Code for SPK-05" width="220" height="220" />
-      </div>
-      <div class="card-details">
-        <div class="person-name">Company Field & Partner Testing</div>
-        <div class="info-row"><b>MAC:</b> <span class="mono">A0:F2:62:E3:4C:74</span></div>
-        <div class="info-row"><b>Assigned ID:</b> <span class="mono">PAT-DEMO-01</span></div>
-        <div class="info-row"><b>Location:</b> Executive Demo Lounge</div>
-      </div>
-      <div class="card-footer">
-        Scan via Dashboard Webcam for Zero-Touch Pairing
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-05</div>
+        <div class="mac-text">28:84:85:B2:A9:A4</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
       </div>
     </div>
     
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-06_1cm.svg" alt="SPK-06" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-06</div>
+        <div class="mac-text">A0:F2:62:E3:4C:75</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-07_1cm.svg" alt="SPK-07" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-07</div>
+        <div class="mac-text">A0:F2:62:E3:4C:76</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-08_1cm.svg" alt="SPK-08" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-08</div>
+        <div class="mac-text">A0:F2:62:E3:4C:77</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-09_1cm.svg" alt="SPK-09" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-09</div>
+        <div class="mac-text">A0:F2:62:E3:4C:78</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-10_1cm.svg" alt="SPK-10" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-10</div>
+        <div class="mac-text">A0:F2:62:E3:4C:79</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-11_1cm.svg" alt="SPK-11" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-11</div>
+        <div class="mac-text">A0:F2:62:E3:4C:7A</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-12_1cm.svg" alt="SPK-12" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-12</div>
+        <div class="mac-text">A0:F2:62:E3:4C:7B</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-13_1cm.svg" alt="SPK-13" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-13</div>
+        <div class="mac-text">A0:F2:62:E3:4C:7C</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-14_1cm.svg" alt="SPK-14" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-14</div>
+        <div class="mac-text">A0:F2:62:E3:4C:7D</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-15_1cm.svg" alt="SPK-15" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-15</div>
+        <div class="mac-text">A0:F2:62:E3:4C:7E</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-16_1cm.svg" alt="SPK-16" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-16</div>
+        <div class="mac-text">A0:F2:62:E3:4C:7F</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-17_1cm.svg" alt="SPK-17" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-17</div>
+        <div class="mac-text">A0:F2:62:E3:4C:80</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-18_1cm.svg" alt="SPK-18" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-18</div>
+        <div class="mac-text">A0:F2:62:E3:4C:81</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-19_1cm.svg" alt="SPK-19" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-19</div>
+        <div class="mac-text">A0:F2:62:E3:4C:82</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    <div class="chassis-badge">
+      <div class="qr-box">
+        <img src="SPK-20_1cm.svg" alt="SPK-20" class="qr-exact-1cm" />
+      </div>
+      <div class="text-box">
+        <div class="header-line">
+          <span class="brand-tag"><span class="dot"></span>YHEALTH</span>
+          <span class="role-pill" style="background:#0284c7;">BEDSIDE</span>
+        </div>
+        <div class="device-title">SPK-20</div>
+        <div class="mac-text">A0:F2:62:E3:4C:83</div>
+        <div class="model-text">ESP32-S3 VOICE ASSISTANT</div>
+      </div>
+    </div>
+    
+    </div>
+
+    <div class="sec-header" style="margin-top: 24px;">
+      FORMAT B: Ultra-Micro QR Stickers (14mm × 18mm) &bull; 1.0 cm Vector QR with Device ID
+    </div>
+    <div class="micro-grid">
+      
+    <div class="micro-badge">
+      <img src="SPK-01_1cm.svg" alt="SPK-01" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-01</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-02_1cm.svg" alt="SPK-02" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-02</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-03_1cm.svg" alt="SPK-03" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-03</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-04_1cm.svg" alt="SPK-04" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-04</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-05_1cm.svg" alt="SPK-05" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-05</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-06_1cm.svg" alt="SPK-06" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-06</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-07_1cm.svg" alt="SPK-07" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-07</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-08_1cm.svg" alt="SPK-08" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-08</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-09_1cm.svg" alt="SPK-09" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-09</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-10_1cm.svg" alt="SPK-10" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-10</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-11_1cm.svg" alt="SPK-11" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-11</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-12_1cm.svg" alt="SPK-12" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-12</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-13_1cm.svg" alt="SPK-13" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-13</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-14_1cm.svg" alt="SPK-14" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-14</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-15_1cm.svg" alt="SPK-15" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-15</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-16_1cm.svg" alt="SPK-16" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-16</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-17_1cm.svg" alt="SPK-17" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-17</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-18_1cm.svg" alt="SPK-18" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-18</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-19_1cm.svg" alt="SPK-19" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-19</div>
+    </div>
+    
+    <div class="micro-badge">
+      <img src="SPK-20_1cm.svg" alt="SPK-20" class="qr-exact-1cm" />
+      <div class="micro-title">SPK-20</div>
+    </div>
+    
+    </div>
   </div>
+
 </body>
 </html>

@@ -1,0 +1,16 @@
+[
+  {
+    "id": "USR-001",
+    "full_name": "Tanvi Gupta",
+    "username": "tanvi",
+    "email": "gupta.tanvi@tftus.com",
+    "password_hash": "3afafb1ed1cd3f78a30ef9b9baeebd209e6e87a51f4c5758a9e1976f8c257896",
+    "salt": "7f281105ceffda8b6dedf809d5f1e21c",
+    "role": "Admin",
+    "status": "Active",
+    "joined_date": "March 12, 2024",
+    "last_active": "Just now",
+    "avatar_color": "#10b981",
+    "is_protected": true
+  }
+]

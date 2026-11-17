@@ -1,4 +1,5 @@
 #include "wifi_connect.h"
+#include "captive_portal.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -32,8 +33,22 @@ static const char *s_passes[] = {WIFI_PASS_PRIMARY, WIFI_PASS_PRIMARY,
                                  WIFI_PASS_ALT};
 
 static void switch_to_next_ap(void) {
+  // If custom Wi-Fi credentials were provisioned via USB/NVS and failed, launch Captive Portal!
+  if (s_has_nvs_wifi) {
+    ESP_LOGW(TAG, "⚠️ [NETWORK_LOG] Saved Wi-Fi '%s' not reachable. Launching SoftAP Captive Portal for phone setup...", s_nvs_ssid);
+    captive_portal_start(NULL);
+    return;
+  }
+
   s_ap_index = (s_ap_index + 1) % 3;
   s_retry_num = 0;
+
+  // If all default SSIDs have been tried, launch SoftAP Captive Portal!
+  if (s_ap_index == 0) {
+    ESP_LOGW(TAG, "⚠️ All fallback Wi-Fi networks unreachable. Starting SoftAP Captive Portal...");
+    captive_portal_start(NULL);
+    return;
+  }
 
   wifi_config_t wifi_config = {0};
   strncpy((char *)wifi_config.sta.ssid, s_ssids[s_ap_index],
@@ -44,7 +59,7 @@ static void switch_to_next_ap(void) {
   wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
   wifi_config.sta.threshold.authmode =
       (strlen(s_passes[s_ap_index]) > 0) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-  wifi_config.sta.pmf_cfg.capable = false;
+  wifi_config.sta.pmf_cfg.capable = true;
   wifi_config.sta.pmf_cfg.required = false;
 
   ESP_LOGI(TAG, "🔄 Switching Wi-Fi target AP to [%d/3]: SSID='%s'",
@@ -130,7 +145,7 @@ esp_err_t wifi_init_sta(void) {
               .threshold.authmode = WIFI_AUTH_WPA2_PSK,
               .pmf_cfg =
                   {
-                      .capable = false,
+                      .capable = true,
                       .required = false,
                   },
               .sae_pwe_h2e = WPA3_SAE_PWE_UNSPECIFIED,
@@ -158,11 +173,13 @@ esp_err_t wifi_init_sta(void) {
             sizeof(wifi_config.sta.ssid));
     strncpy((char *)wifi_config.sta.password, s_nvs_pass,
             sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = (strlen(s_nvs_pass) > 0) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
   } else {
     strncpy((char *)wifi_config.sta.ssid, s_ssids[0],
             sizeof(wifi_config.sta.ssid));
     strncpy((char *)wifi_config.sta.password, s_passes[0],
             sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = (strlen(s_passes[0]) > 0) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
   }
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -180,14 +197,19 @@ esp_err_t wifi_init_sta(void) {
 
   EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                          WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                         pdFALSE, pdFALSE, portMAX_DELAY);
+                                         pdFALSE, pdFALSE, pdMS_TO_TICKS(14000));
 
   if (bits & WIFI_CONNECTED_BIT) {
-    ESP_LOGI(TAG, "Rock-solid Wi-Fi link established with SSID: %s",
-             s_ssids[s_ap_index]);
+    const char *active_ssid = s_has_nvs_wifi ? s_nvs_ssid : s_ssids[s_ap_index];
+    ESP_LOGI(TAG, "Rock-solid Wi-Fi link established with SSID: %s", active_ssid);
     return ESP_OK;
   } else {
-    ESP_LOGE(TAG, "Failed to establish Wi-Fi connection!");
-    return ESP_FAIL;
+    ESP_LOGW(TAG, "⚠️ Wi-Fi not reachable within 14s. Launching SoftAP Captive Portal: 'YHealth-Setup'...");
+    captive_portal_start(NULL);
+    // Keep task alive waiting for phone configuration & restart
+    while (captive_portal_is_active()) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    return ESP_OK;
   }
 }

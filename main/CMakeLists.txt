@@ -4,6 +4,7 @@ set(SOURCES
     "hardeware_driver/bsp_board.c"
     "rgb_led_driver/rgb_led_driver.c"
     "wifi_driver/wifi_connect.c"
+    "wifi_driver/captive_portal.c"
 )
 
 set(INCLUDE_DIRS
@@ -16,5 +17,5 @@ set(INCLUDE_DIRS
 idf_component_register(
     SRCS ${SOURCES}
     INCLUDE_DIRS ${INCLUDE_DIRS}
-    REQUIRES driver esp_driver_gpio esp_driver_i2c esp_driver_i2s esp_ringbuf esp_timer led_strip esp_codec_dev log freertos esp_wifi esp_event nvs_flash esp_http_client mbedtls lwip esp_netif
+    REQUIRES driver esp_driver_gpio esp_driver_i2c esp_driver_i2s esp_ringbuf esp_timer led_strip esp_codec_dev log freertos esp_wifi esp_event nvs_flash esp_http_client esp_http_server mbedtls lwip esp_netif
 )

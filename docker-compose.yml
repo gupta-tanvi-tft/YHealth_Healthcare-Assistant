@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  voice-assistant-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: yhealth-voice-backend
+    restart: unless-stopped
+    ports:
+      - "8008:8008"
+    env_file:
+      - ./backend/.env
+    environment:
+      - PORT=8008
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/api/active-speakers"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - yhealth-net
+
+  fleet-dashboard:
+    build:
+      context: ./fleet-dashboard
+      dockerfile: Dockerfile
+    container_name: yhealth-fleet-dashboard
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    environment:
+      - DASHBOARD_MODE=production
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./fleet-dashboard/backend/fleet_db.json:/app/backend/fleet_db.json
+      - ./fleet-dashboard/backend/users_db.json:/app/backend/users_db.json
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/api/speakers"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    networks:
+      - yhealth-net
+
+networks:
+  yhealth-net:
+    driver: bridge

@@ -1,0 +1,2 @@
+# SSL certificates directory.
+# Managed by init-ssl.sh or mounted by Docker.

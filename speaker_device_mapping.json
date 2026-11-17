@@ -1,0 +1,388 @@
+{
+  "version": "1.0.0",
+  "total_slots": 20,
+  "description": "Central Hardware Mapping: Device ID <-> MAC Address <-> 1cm QR Code <-> Wi-Fi State. Name and Persona to be assigned later by user.",
+  "last_updated": "2026-11-10T05:48:51.289577+00:00",
+  "mappings": [
+    {
+      "slot": 1,
+      "device_id": "SPK-01",
+      "mac_address": "A0:F2:62:E3:4C:70",
+      "qr_code_file": "speaker_qr_codes/SPK-01_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-01",
+        "mac": "A0:F2:62:E3:4C:70",
+        "role": "doctor"
+      },
+      "wifi_status": "configured",
+      "wifi_ssid": "TFTus-WiFi",
+      "ip_address": "192.168.50.96",
+      "assigned_name": "Dr. Brij Mohan Makkar",
+      "persona": "doctor_endocrinologist",
+      "status": "active",
+      "notes": "Unit 1 currently active for Dr. Makkar consultation room"
+    },
+    {
+      "slot": 2,
+      "device_id": "SPK-02",
+      "mac_address": "28:84:85:B2:BC:B8",
+      "qr_code_file": "speaker_qr_codes/SPK-02_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-02",
+        "mac": "28:84:85:B2:BC:B8",
+        "role": "doctor"
+      },
+      "wifi_status": "flashed_and_identified",
+      "wifi_ssid": "TFTus-WiFi",
+      "ip_address": null,
+      "assigned_name": "Dr. Brij Mohan Makkar",
+      "persona": "doctor_endocrinologist",
+      "status": "active",
+      "notes": "Speaker 2 associated with Dr. Brij Mohan Makkar (Desk). Real Hardware MAC: 28:84:85:B2:BC:B8"
+    },
+    {
+      "slot": 3,
+      "device_id": "SPK-03",
+      "mac_address": "28:84:85:B2:BB:C8",
+      "qr_code_file": "speaker_qr_codes/SPK-03_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-03",
+        "mac": "28:84:85:B2:BB:C8",
+        "role": "doctor"
+      },
+      "wifi_status": "flashed_and_identified",
+      "wifi_ssid": "TFTus-WiFi",
+      "ip_address": null,
+      "assigned_name": "Dr. Brij Mohan Makkar",
+      "persona": "doctor_endocrinologist",
+      "status": "active",
+      "notes": "Speaker 3 associated with Dr. Brij Mohan Makkar (Exam). Real Hardware MAC: 28:84:85:B2:BB:C8"
+    },
+    {
+      "slot": 4,
+      "device_id": "SPK-04",
+      "mac_address": "28:84:85:B2:BD:BC",
+      "qr_code_file": "speaker_qr_codes/SPK-04_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-04",
+        "mac": "28:84:85:B2:BD:BC",
+        "role": "patient"
+      },
+      "wifi_status": "flashed_and_identified",
+      "wifi_ssid": "TFTus-WiFi",
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "active",
+      "notes": "Device 4 flashed successfully on COM8. Real Hardware MAC: 28:84:85:B2:BD:BC"
+    },
+    {
+      "slot": 5,
+      "device_id": "SPK-05",
+      "mac_address": "28:84:85:B2:A9:A4",
+      "qr_code_file": "speaker_qr_codes/SPK-05_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-05",
+        "mac": "28:84:85:B2:A9:A4",
+        "role": "patient"
+      },
+      "wifi_status": "flashed_and_identified",
+      "wifi_ssid": "TFTus-WiFi",
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "active",
+      "notes": "Device 5 flashed successfully on COM9. Real Hardware MAC: 28:84:85:B2:A9:A4"
+    },
+    {
+      "slot": 6,
+      "device_id": "SPK-06",
+      "mac_address": "A0:F2:62:E3:4C:75",
+      "qr_code_file": "speaker_qr_codes/SPK-06_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-06",
+        "mac": "A0:F2:62:E3:4C:75",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 7,
+      "device_id": "SPK-07",
+      "mac_address": "A0:F2:62:E3:4C:76",
+      "qr_code_file": "speaker_qr_codes/SPK-07_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-07",
+        "mac": "A0:F2:62:E3:4C:76",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 8,
+      "device_id": "SPK-08",
+      "mac_address": "A0:F2:62:E3:4C:77",
+      "qr_code_file": "speaker_qr_codes/SPK-08_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-08",
+        "mac": "A0:F2:62:E3:4C:77",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 9,
+      "device_id": "SPK-09",
+      "mac_address": "A0:F2:62:E3:4C:78",
+      "qr_code_file": "speaker_qr_codes/SPK-09_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-09",
+        "mac": "A0:F2:62:E3:4C:78",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 10,
+      "device_id": "SPK-10",
+      "mac_address": "A0:F2:62:E3:4C:79",
+      "qr_code_file": "speaker_qr_codes/SPK-10_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-10",
+        "mac": "A0:F2:62:E3:4C:79",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 11,
+      "device_id": "SPK-11",
+      "mac_address": "A0:F2:62:E3:4C:7A",
+      "qr_code_file": "speaker_qr_codes/SPK-11_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-11",
+        "mac": "A0:F2:62:E3:4C:7A",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 12,
+      "device_id": "SPK-12",
+      "mac_address": "A0:F2:62:E3:4C:7B",
+      "qr_code_file": "speaker_qr_codes/SPK-12_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-12",
+        "mac": "A0:F2:62:E3:4C:7B",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 13,
+      "device_id": "SPK-13",
+      "mac_address": "A0:F2:62:E3:4C:7C",
+      "qr_code_file": "speaker_qr_codes/SPK-13_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-13",
+        "mac": "A0:F2:62:E3:4C:7C",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 14,
+      "device_id": "SPK-14",
+      "mac_address": "A0:F2:62:E3:4C:7D",
+      "qr_code_file": "speaker_qr_codes/SPK-14_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-14",
+        "mac": "A0:F2:62:E3:4C:7D",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 15,
+      "device_id": "SPK-15",
+      "mac_address": "A0:F2:62:E3:4C:7E",
+      "qr_code_file": "speaker_qr_codes/SPK-15_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-15",
+        "mac": "A0:F2:62:E3:4C:7E",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 16,
+      "device_id": "SPK-16",
+      "mac_address": "A0:F2:62:E3:4C:7F",
+      "qr_code_file": "speaker_qr_codes/SPK-16_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-16",
+        "mac": "A0:F2:62:E3:4C:7F",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 17,
+      "device_id": "SPK-17",
+      "mac_address": "A0:F2:62:E3:4C:80",
+      "qr_code_file": "speaker_qr_codes/SPK-17_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-17",
+        "mac": "A0:F2:62:E3:4C:80",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 18,
+      "device_id": "SPK-18",
+      "mac_address": "A0:F2:62:E3:4C:81",
+      "qr_code_file": "speaker_qr_codes/SPK-18_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-18",
+        "mac": "A0:F2:62:E3:4C:81",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 19,
+      "device_id": "SPK-19",
+      "mac_address": "A0:F2:62:E3:4C:82",
+      "qr_code_file": "speaker_qr_codes/SPK-19_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-19",
+        "mac": "A0:F2:62:E3:4C:82",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    },
+    {
+      "slot": 20,
+      "device_id": "SPK-20",
+      "mac_address": "A0:F2:62:E3:4C:83",
+      "qr_code_file": "speaker_qr_codes/SPK-20_QR.png",
+      "qr_code_size": "1cm x 1cm (10mm x 10mm)",
+      "qr_payload": {
+        "id": "SPK-20",
+        "mac": "A0:F2:62:E3:4C:83",
+        "role": "unassigned"
+      },
+      "wifi_status": "pending_wifi_handshake",
+      "wifi_ssid": null,
+      "ip_address": null,
+      "assigned_name": null,
+      "persona": null,
+      "status": "awaiting_wifi",
+      "notes": "Unpaired hardware slot. Connect speaker to Wi-Fi to auto-bind MAC."
+    }
+  ]
+}

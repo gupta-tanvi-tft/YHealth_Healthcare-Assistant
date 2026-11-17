@@ -1,0 +1,3 @@
+@echo off
+echo Initializing ESP-IDF v5.5.5 Environment...
+call C:\esp\v5.5.5\esp-idf\export.bat

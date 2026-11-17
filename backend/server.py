@@ -77,11 +77,11 @@ PERSONA_HARDWARE_TOKEN = os.getenv("PERSONA_HARDWARE_TOKEN", "")
 BYTES_PER_SEC_OUT = 32000.0
 OUT_GAIN = float(os.getenv("GEMINI_OUT_GAIN", "0.46"))       # applied while resampling 24k->16k
 IN_GAIN = float(os.getenv("GEMINI_IN_GAIN", "1.4"))          # mic boost
-MAX_LEAD_S = float(os.getenv("PLAYBACK_MAX_LEAD_S", "0.6"))  # keep extra headroom in the 2 s ESP playback ring
-TARGET_LEAD_S = float(os.getenv("PLAYBACK_TARGET_LEAD_S", "0.3"))
+MAX_LEAD_S = float(os.getenv("PLAYBACK_MAX_LEAD_S", "1.0"))  # keep extra headroom in the 2 s ESP playback ring
+TARGET_LEAD_S = float(os.getenv("PLAYBACK_TARGET_LEAD_S", "0.6"))
 # Small PCM WebSocket frames avoid a burst filling the ESP32 playback ring.
 # Keep this well below the device's 32 KiB transport buffer.
-AUDIO_WS_CHUNK_BYTES = max(512, min(4096, int(os.getenv("AUDIO_WS_CHUNK_BYTES", "2048"))))
+AUDIO_WS_CHUNK_BYTES = max(512, min(4096, int(os.getenv("AUDIO_WS_CHUNK_BYTES", "1024"))))
 if AUDIO_WS_CHUNK_BYTES & 1:
     AUDIO_WS_CHUNK_BYTES -= 1
 POST_PLAYBACK_MUTE_S = 0.6                                   # ignore mic this long after the speaker finishes
@@ -890,12 +890,13 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
     Constructs a compact, high-density clinical slice for Gemini instead of
     transmitting the entire multi-kilobyte persona.
     Preserves all clinically safety-critical fields:
-      - Demographics (name, age, gender)
-      - Vitals (BP, HR, Weight, BMI, Blood Glucose)
-      - Key Labs (HbA1c, Fasting Glucose, Lipids, eGFR, Creatinine)
-      - Active Medications (name, dosage, frequency)
-      - Allergies & Clinical Alerts
-      - Chronic Conditions & Recent Clinical Notes
+      - Demographics (name, age, gender, date_of_birth)
+      - Anthropometry & Body Composition (weight_kg, height_cm, bmi, bmr)
+      - Vitals & Face Scan Extraction (pulse_rate, respiration_rate, spo2)
+      - Labs & Screening Estimates (estimated HbA1c, hemoglobin, risk scores)
+      - Confirmed Diagnoses vs Screening Risks (Zero Hallucination)
+      - Active Medications (exact dosages and frequencies)
+      - Allergies & Care Program
     """
     if not isinstance(raw_data, dict) or not raw_data:
         return {"status": "no_record_found"}
@@ -910,11 +911,11 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
 
     # 1. Demographics
     identity = p.get("identity") or p.get("patient") or p.get("user") or {}
+    demo = {}
     if isinstance(identity, dict):
         fn = identity.get("first_name") or identity.get("firstName") or ""
         ln = identity.get("last_name") or identity.get("lastName") or ""
         name = f"{fn} {ln}".strip() or identity.get("name") or identity.get("full_name") or ""
-        demo = {}
         if name:
             demo["name"] = name
         age = identity.get("age_years") or identity.get("age")
@@ -923,29 +924,95 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
         gender = identity.get("gender") or identity.get("sex")
         if gender:
             demo["gender"] = gender
+        dob = identity.get("date_of_birth") or identity.get("dob")
+        if dob:
+            demo["date_of_birth"] = dob
         if demo:
             slice_data["demographics"] = demo
 
-    # 2. Vitals (clean & compact)
+    # 2. Anthropometry & Body Composition (Weight, Height, BMI, BMR)
+    anth = identity.get("anthropometry") if isinstance(identity, dict) else {}
+    wt_meas = p.get("weight_and_composition_profile", {}).get("latest_measurement") if isinstance(p.get("weight_and_composition_profile"), dict) else {}
+    body_comp = {}
+    wt = (anth.get("weight_kg") if isinstance(anth, dict) else None) or (wt_meas.get("weight_kg") if isinstance(wt_meas, dict) else None)
+    if wt:
+        body_comp["weight"] = f"{wt} kg"
+    ht = anth.get("height_cm") if isinstance(anth, dict) else None
+    if ht:
+        body_comp["height"] = f"{ht} cm"
+    bmi = (anth.get("bmi") if isinstance(anth, dict) else None) or (wt_meas.get("bmi") if isinstance(wt_meas, dict) else None)
+    bmi_cat = (anth.get("bmi_category") if isinstance(anth, dict) else None) or (wt_meas.get("bmi_category") if isinstance(wt_meas, dict) else None)
+    if bmi:
+        body_comp["bmi"] = f"{bmi} ({bmi_cat})" if bmi_cat else str(bmi)
+    bmr = anth.get("bmr_kcal") if isinstance(anth, dict) else None
+    if bmr:
+        body_comp["bmr"] = f"{bmr} kcal"
+    m_cal = anth.get("maintenance_calories_kcal") if isinstance(anth, dict) else None
+    if m_cal:
+        body_comp["maintenance_calories"] = f"{m_cal} kcal"
+    wl_cal = anth.get("weight_loss_calories_kcal") if isinstance(anth, dict) else None
+    if wl_cal:
+        body_comp["weight_loss_calories"] = f"{wl_cal} kcal"
+    if body_comp:
+        slice_data["body_composition"] = body_comp
+
+    # 3. Vitals (clean & compact) & Face Scan Extraction
+    clean_vitals = {}
     vitals = p.get("vitals") or p.get("vital_signs") or {}
     if isinstance(vitals, dict) and vitals:
-        clean_vitals = {}
         for k in ("blood_pressure", "bp", "systolic_bp", "diastolic_bp", "heart_rate", "pulse",
                   "weight", "weight_kg", "bmi", "blood_glucose", "random_blood_sugar",
                   "fasting_blood_sugar", "hba1c", "spo2", "temperature"):
             v = vitals.get(k)
             if v is not None and v != "":
                 clean_vitals[k] = v.get("value") if isinstance(v, dict) else v
-        if clean_vitals:
-            slice_data["vitals"] = clean_vitals
 
-    # 3. Key Laboratory Results (HbA1c, Glucose, Lipid, Kidney)
+    face_scan = p.get("face_scan_profile", {}).get("latest_scan") if isinstance(p.get("face_scan_profile"), dict) else {}
+    if isinstance(face_scan, dict) and face_scan:
+        f_vitals = face_scan.get("vital_signs_extracted") or {}
+        if isinstance(f_vitals, dict):
+            if f_vitals.get("pulse_rate_bpm"):
+                clean_vitals["pulse_rate"] = f"{f_vitals.get('pulse_rate_bpm')} bpm"
+            if f_vitals.get("oxygen_saturation_percent"):
+                clean_vitals["spo2"] = f"{f_vitals.get('oxygen_saturation_percent')}%"
+            if f_vitals.get("respiration_rate_rpm"):
+                clean_vitals["respiration_rate"] = f"{f_vitals.get('respiration_rate_rpm')} rpm"
+    if clean_vitals:
+        slice_data["vitals"] = clean_vitals
+
+    # 4. Lab Results & Screening Estimates
+    key_labs = {}
+    if isinstance(face_scan, dict) and face_scan:
+        f_labs = face_scan.get("lab_estimates") or {}
+        if isinstance(f_labs, dict):
+            if f_labs.get("hba1c_percent"):
+                key_labs["estimated_hba1c_face_scan"] = f"{f_labs.get('hba1c_percent')}%"
+            if f_labs.get("hemoglobin_gdl"):
+                key_labs["hemoglobin_face_scan"] = f"{f_labs.get('hemoglobin_gdl')} g/dL"
+        f_risks = face_scan.get("risk_scores") or {}
+        if isinstance(f_risks, dict):
+            risks_summary = []
+            for rk, rv in f_risks.items():
+                if rv:
+                    risks_summary.append(f"{rk.replace('_', ' ').title()}: {rv}")
+            if risks_summary:
+                key_labs["screening_risk_scores"] = risks_summary
+            if f_risks.get("diabetes_risk"):
+                key_labs["diabetes_screening_risk"] = f_risks.get("diabetes_risk")
+            if f_risks.get("hypertension_risk"):
+                key_labs["hypertension_screening_risk"] = f_risks.get("hypertension_risk")
+        stress = face_scan.get("stress_metrics") or {}
+        if isinstance(stress, dict) and stress.get("stress_level"):
+            key_labs["stress_level"] = stress.get("stress_level")
+        wellness = face_scan.get("wellness_metrics") or {}
+        if isinstance(wellness, dict) and wellness.get("wellness_level"):
+            key_labs["wellness_level"] = wellness.get("wellness_level")
+
     labs_prof = p.get("lab_results_profile") or {}
     latest_report = labs_prof.get("latest_report") if isinstance(labs_prof, dict) else {}
-    cgm = p.get("cgm_metrics") or p.get("cgm") or {}
+    cgm = p.get("cgm_metrics") or p.get("cgm") or p.get("cgm_profile") or {}
     labs_list = p.get("lab_reports") or p.get("labs") or []
 
-    key_labs = {}
     if isinstance(cgm, dict) and cgm:
         avg_g = cgm.get("average_glucose") or cgm.get("mean_glucose")
         if avg_g:
@@ -976,9 +1043,27 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
                     key_labs[test] = f"{val} {unit}".strip() + (f" ({dt})" if dt else "")
 
     if key_labs:
-        slice_data["latest_labs"] = key_labs
+        slice_data["labs_and_screening"] = key_labs
+    else:
+        slice_data["labs_and_screening"] = "No formal lab reports or CGM on file"
 
-    # 4. Active Medications
+    # 5. Clinical Context & Confirmed Diagnoses (Anti-Hallucination Guard)
+    clin_ctx = p.get("clinical_context") if isinstance(p.get("clinical_context"), dict) else {}
+    diag_list = clin_ctx.get("diagnoses") or p.get("diagnoses") or p.get("chronic_conditions") or []
+    if isinstance(diag_list, list) and diag_list:
+        slice_data["confirmed_diagnoses"] = [str(c).strip() for c in diag_list[:5] if c]
+    else:
+        is_diab = clin_ctx.get("is_diabetic", False)
+        is_htn = clin_ctx.get("is_hypertensive", False)
+        slice_data["confirmed_diagnoses"] = f"None recorded on file (is_diabetic={is_diab}, is_hypertensive={is_htn}). Screening risk is NOT a confirmed diagnosis."
+
+    allergies = clin_ctx.get("allergies_and_restrictions") or p.get("allergies") or p.get("known_allergies") or []
+    if allergies and isinstance(allergies, list) and any(allergies):
+        slice_data["allergies"] = [str(a).strip() for a in allergies[:5] if a]
+    else:
+        slice_data["allergies"] = "None recorded"
+
+    # 6. Active Medications
     meds_prof = p.get("medications_profile") or {}
     active_meds = meds_prof.get("active_medications") if isinstance(meds_prof, dict) else None
     active_meds = active_meds or p.get("medications") or p.get("current_medications") or []
@@ -990,29 +1075,21 @@ def slice_patient_persona(raw_data: dict, max_chars: int = 2500) -> dict:
                 dose = m.get("dosage") or m.get("dose") or ""
                 freq = m.get("frequency") or m.get("timing") or ""
                 med_slices.append(f"{m_name} {dose} {freq}".strip())
-            elif isinstance(m, str):
+            elif isinstance(m, str) and m.strip():
                 med_slices.append(m.strip())
         if med_slices:
             slice_data["active_medications"] = med_slices
-
-    # 5. Allergies & Clinical Alerts
-    allergies = p.get("allergies") or p.get("known_allergies") or []
-    if allergies:
-        if isinstance(allergies, list):
-            slice_data["allergies"] = [str(a).strip() for a in allergies[:5] if a]
         else:
-            slice_data["allergies"] = str(allergies)[:150]
+            slice_data["active_medications"] = "None recorded"
+    else:
+        slice_data["active_medications"] = "None recorded"
 
-    alerts = p.get("clinical_alerts") or p.get("alerts") or p.get("risk_flags") or []
-    if alerts:
-        slice_data["clinical_alerts"] = alerts[:3] if isinstance(alerts, list) else str(alerts)[:150]
+    # 7. Care Program
+    prog = p.get("care_team", {}).get("current_program") if isinstance(p.get("care_team"), dict) else {}
+    if isinstance(prog, dict) and prog.get("program_name"):
+        slice_data["care_program"] = prog.get("program_name")
 
-    # 6. Conditions & Medical History
-    conditions = p.get("diagnoses") or p.get("chronic_conditions") or p.get("conditions") or []
-    if conditions:
-        slice_data["conditions"] = [str(c).strip() for c in conditions[:5] if c] if isinstance(conditions, list) else str(conditions)[:150]
-
-    # 7. Recent Summary Notes
+    # 8. Recent Summary Notes
     ns = p.get("narrative_summary") or {}
     summary_note = ns.get("short_summary") if isinstance(ns, dict) else (p.get("summary") or p.get("notes"))
     if summary_note:
@@ -1167,19 +1244,38 @@ def build_doctor_agent_prompt(
     active_count_str = f"Active Patients on Roster: {active_count}\n" if active_count is not None else ""
 
     return (
+        "CRITICAL ROLE OVERRIDE — MANDATORY DIRECTIVE:\n"
+        f"You are speaking directly with Dr. {doctor_name} ({specialization}), who is a senior licensed physician and medical specialist in clinic. "
+        "DR. MAKKAR IS HIMSELF THE DOCTOR. HE DOES NOT NEED A DOCTOR.\n"
+        "FORBIDDEN PHRASES — NEVER UNDER ANY CIRCUMSTANCE SAY:\n"
+        "- 'consult a healthcare professional'\n"
+        "- 'refer to a healthcare professional'\n"
+        "- 'consult a doctor' or 'consult your doctor'\n"
+        "- 'consult a physician' or 'consult a specialist'\n"
+        "- 'please consult' or 'seek medical advice'\n"
+        "- 'talk to your doctor' or 'this is not medical advice'\n"
+        "Giving consumer disclaimers or advising Dr. Makkar to consult or refer to anyone is strictly prohibited. Provide direct clinical analysis, exact numbers, and laboratory facts only.\n\n"
         f"You are YHealth Assist, an intelligent clinical AI assistant speaking directly with Dr. {doctor_name}, "
         f"{specialization} at {clinic_name}. You assist consultations hands-free over voice.\n\n"
         "CORE RULES:\n"
-        "1. NATURAL HINGLISH & MODERN CLINIC CADENCE: Speak in natural Indian English or modern doctor **Hinglish** (the everyday conversational mix of Hindi and English spoken in Indian clinics). "
-        "STRICT TERMINOLOGY RULE: NEVER say 'mariz' (मरीज़). ALWAYS use the word 'patient' (e.g., 'Kis patient se shuru karna hai?', 'Patient ka record loaded hai'). "
-        "NO PURE / SHUDDH HINDI: Do NOT use heavy, formal, or textbook Hindi (avoid words like 'शुभ दोपहर', 'सुप्रभात', 'मरीज़', 'चिकित्सक'). Use natural clinic Hinglish with English terms for clinical concepts ('patient', 'record', 'file', 'report', 'bp', 'sugar', 'dose'). "
-        "Mirror the doctor's tone naturally. NEVER output language headers like 'English:' or 'Hindi:'.\n"
+        "1. UNIVERSAL MULTI-LANGUAGE FLUENCY (ALL REGIONAL & GLOBAL LANGUAGES): Speak and understand seamlessly in ANY regional Indian language (Hindi, Punjabi, Bengali, Marathi, Gujarati, Tamil, Telugu, Kannada, Malayalam, Odia, Urdu, etc.), clinic Hinglish, or global language (English, Spanish, French, German, Arabic, etc.). "
+        "Mirror the doctor's language automatically: if the doctor speaks in English, answer in English; if in Hindi/Hinglish, answer in natural clinic Hinglish; if in Punjabi, answer in Punjabi; if in any other regional or global language, reply fluently in that exact language. "
+        "STRICT TERMINOLOGY RULE: When speaking Hindi/Hinglish, NEVER say 'mariz' (मरीज़); ALWAYS use the word 'patient' (e.g., 'Kis patient se shuru karna hai?', 'Patient ka record loaded hai'). "
+        "NO PURE / SHUDDH HINDI: Do NOT use heavy, formal, or textbook Hindi (avoid words like 'शुभ दोपहर', 'सुप्रभात', 'मरीज़', 'चिकित्सक'). Use natural spoken conversational cadence with standard clinical terms ('patient', 'record', 'file', 'report', 'bp', 'sugar', 'dose', 'weight', 'vitals'). "
+        "NEVER output language headers or translation labels like 'English:' or 'Hindi:'.\n"
         "2. EXTREME CLINICAL CONCISENESS (TOKEN EFFICIENCY): Spoken answers must strictly be 1 direct sentence (maximum 2 sentences if answering multiple metrics). "
         "Do not repeat the question or re-state patient demographics in the answer. State the numbers immediately. Zero filler, zero unsolicited advice, zero unasked metrics.\n"
-        "3. STRICT GROUNDING: Cite exact numbers, units, and dates from the patient record. Never extrapolate or guess. If not present: 'That information is not in the record.'\n"
-        "4. DOCTOR AUDIENCE (ABSOLUTELY ZERO MEDICAL DISCLAIMERS): The person speaking to you IS the licensed physician ({salutation}) treating their patients in clinic. "
-        "STRICTLY FORBIDDEN: NEVER EVER say 'consult a healthcare professional', 'consult a healthcare patient', 'consult a doctor', 'consult a physician', 'consult a specialist', 'please consult', 'seek medical advice', 'talk to your doctor', or 'this is not medical advice'. "
-        "You are an assistant TO the doctor; giving consumer disclaimers or telling the doctor to consult anyone is strictly forbidden. Directly provide the requested clinical data, lab values, and medication information to {salutation}.\n"
+        "3. STRICT GROUNDING & ZERO HALLUCINATIONS: When a patient record is loaded (via load_patient_record or clinical slice), read directly and exclusively from the returned patient data. Cite exact numbers, units, and categories from all sections:\n"
+        "   - Demographics: Name, age, gender, date of birth.\n"
+        "   - Body composition: Weight, height, BMI, BMI category, BMR, maintenance/weight loss calories.\n"
+        "   - Vitals: Pulse rate, SpO2, respiration rate, blood pressure.\n"
+        "   - Screening estimates & labs: Face scan estimates (estimated HbA1c, hemoglobin), screening risk scores (e.g. Diabetes Risk: Medium, Hypertension Risk: Medium), stress and wellness levels.\n"
+        "   - Diagnoses: If confirmed_diagnoses says 'None recorded', state clearly that no confirmed diagnoses are recorded on file. A screening risk score (e.g. Medium diabetes risk) is NOT a confirmed diagnosis; NEVER invent Type 2 diabetes or hypertension.\n"
+        "   - Medications & Allergies: Report active medications and allergies or state 'None recorded'.\n"
+        "   - When the doctor asks for a summary or what details are in the record: summarize all available sections concisely (Name, Age, Weight, BMI, Vitals, Screening risks, and state that there are no confirmed diagnoses or active medications on file).\n"
+        "   - NEVER claim a metric is missing if it is present in the record. If an exact metric is truly absent, state directly: 'Record mein yeh detail available nahi hai, Doctor.' Never invent diseases, lab values, or medications.\n"
+        "4. DOCTOR AUDIENCE (ABSOLUTELY ZERO MEDICAL DISCLAIMERS & NO REFERRAL ADVICE): The person speaking to you IS the licensed physician and specialist ({salutation}) treating their patients in clinic. "
+        "STRICTLY FORBIDDEN: NEVER EVER say 'refer to a healthcare professional', 'consult a healthcare professional', 'consult a doctor', 'consult a physician', 'consult a specialist', 'please consult', 'seek medical advice', 'talk to your doctor', 'advise you to consult', or 'this is not medical advice'. Under NO circumstances should you ever give consumer disclaimers or tell the doctor to refer or consult anyone. You are speaking directly to Dr. Makkar himself; provide direct clinical findings, numbers, and facts only.\n"
         "5. CRITICAL VALUES: If glucose <54 or >350 mg/dL, systolic BP >180, or diastolic BP >120, state the critical metric first in a clear, calm tone.\n"
         "6. MEDICAL SECURITY: Restricted to clinical care and workflow. Refuse non-medical topics: '{salutation}, I am strictly restricted to clinical patient care.'\n"
         "7. VOICE CADENCE: Warm Indian English / Delhi clinic cadence. Translate phonetic terms ('hba1c' -> HbA1c, 'bp' -> Blood Pressure). Never spell raw URLs or IDs.\n\n"
@@ -1253,12 +1349,15 @@ async def _async_fetch_patient_list_locked(
         _roster_status_by_doctor[doctor_id] = "stale" if stale else "unavailable"
         return stale if stale_expiry > time.time() else []
     api1_started = time.perf_counter()
+    api1_headers = {"accept": "application/json"}
+    if PERSONA_HARDWARE_TOKEN:
+        api1_headers["x-hardware-token"] = PERSONA_HARDWARE_TOKEN
     try:
         client = get_http_client()
         _metric_inc("api1_requests")
         resp = await client.get(
             f"{PATIENTS_API_BASE_URL}/{doctor_id}",
-            headers={"accept": "application/json"},
+            headers=api1_headers,
             timeout=httpx.Timeout(API1_REQUEST_TIMEOUT_S, connect=3.0),
         )
         if resp.status_code == 200:
@@ -1881,7 +1980,41 @@ async def _load_selected_patient(record: dict, doctor_id: str, connection_id: st
                                  {"patient_id": row_id, "persona_id": resolved_id,
                                   "patient_name": full}, REDIS_SESSION_TTL_S)
     logger.info("API 2 persona loaded and identity-verified for the uniquely matched roster patient")
-    return {"status": "found", "matched_patient": full, "patient_data": build_tool_patient_data(persona)}
+    sliced = build_tool_patient_data(persona)
+    bc = sliced.get("body_composition", {}) if isinstance(sliced.get("body_composition"), dict) else {}
+    vt = sliced.get("vitals", {}) if isinstance(sliced.get("vitals"), dict) else {}
+    ls = sliced.get("labs_and_screening", {}) if isinstance(sliced.get("labs_and_screening"), dict) else {}
+    overview_parts = [f"Record loaded for {full}"]
+    demo_bits = []
+    if sliced.get("demographics", {}).get("age"):
+        demo_bits.append(f"{sliced['demographics']['age']}yo")
+    if sliced.get("demographics", {}).get("gender"):
+        demo_bits.append(str(sliced["demographics"]["gender"]))
+    if demo_bits:
+        overview_parts.append(f"({', '.join(demo_bits)})")
+    if bc.get("weight"):
+        overview_parts.append(f"Weight: {bc['weight']}, Height: {bc.get('height', 'N/A')}, BMI: {bc.get('bmi', 'N/A')}")
+    if vt:
+        overview_parts.append(f"Vitals: Pulse {vt.get('pulse_rate', 'N/A')}, SpO2 {vt.get('spo2', 'N/A')}, Resp {vt.get('respiration_rate', 'N/A')}")
+    if ls:
+        risk_strs = []
+        if ls.get("diabetes_screening_risk"):
+            risk_strs.append(f"Diabetes Risk: {ls['diabetes_screening_risk']}")
+        if ls.get("hypertension_screening_risk"):
+            risk_strs.append(f"Hypertension Risk: {ls['hypertension_screening_risk']}")
+        if ls.get("estimated_hba1c_face_scan"):
+            risk_strs.append(f"Est HbA1c: {ls['estimated_hba1c_face_scan']}")
+        if risk_strs:
+            overview_parts.append(f"Screening: {', '.join(risk_strs)}")
+    overview_parts.append(f"Confirmed Diagnoses: {sliced.get('confirmed_diagnoses', 'None recorded')}")
+    clinical_overview_str = ". ".join(overview_parts) + "."
+
+    return {
+        "status": "found",
+        "matched_patient": full,
+        "clinical_overview": clinical_overview_str,
+        "patient_data": sliced,
+    }
 
 
 async def resolve_patient(name_query: str, doctor_id: str = None, connection_id: str = "") -> dict:
@@ -2503,9 +2636,9 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=False,
                     start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                    prefix_padding_ms=200,
-                    silence_duration_ms=650,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                    prefix_padding_ms=100,
+                    silence_duration_ms=250,
                 )),
         )
         if use_advanced:
@@ -2698,8 +2831,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                 try:
                     message = await asyncio.wait_for(websocket.receive(), timeout=0.25)
                 except asyncio.TimeoutError:
-                    # Safety net if the ESP32 never sends audio_end
-                    if streaming and (loop.time() - last_audio_t > 2.0):
+                    # Snappy 500ms safety net if the ESP32 audio_end was delayed
+                    if streaming and (loop.time() - last_audio_t > 0.5):
                         streaming = False
                         logger.info(f"🎤 [Server VAD turn end] {audio_bytes} bytes")
                         audio_bytes = 0
@@ -3196,13 +3329,11 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                 S["last_rx"] = loop.time()
                                 S["turn_pending"] = True
                                 try:
-                                    # Gemini's automatic VAD owns turn-taking; this just flushes cached audio.
+                                    # Flush cached audio and prompt Gemini turn response
                                     await session.send_realtime_input(audio_stream_end=True)
                                     logger.info("🎤 [audio_stream_end] sent to Gemini")
                                 except Exception as e:
-                                    S["gemini_error"] = e
-                                    logger.warning(f"audio_stream_end error: {e}. Reconnecting...")
-                                    break
+                                    logger.debug(f"audio_stream_end notice: {e}")
                             elif kind == "text":
                                 S["last_activity"] = loop.time()
                                 S["last_rx"] = loop.time()
