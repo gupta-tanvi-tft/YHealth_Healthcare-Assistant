@@ -23,7 +23,7 @@ try:
     from redis.asyncio import Redis as AsyncRedis
 except ImportError:  # Allows the backend to start before the Redis extra is installed.
     AsyncRedis = None
-from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -35,6 +35,12 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("gemini-backend")
+
+from voice_biometrics import (
+    load_doctor_voiceprint,
+    verify_speaker_match,
+    extract_voiceprint
+)
 
 # ==========================================================
 # CONFIG
@@ -379,13 +385,15 @@ async def log_inbound_http_request(request: Request, call_next):
     except Exception:
         logger.exception("HTTP IN !! %s %s duration_ms=%.1f", request.method, url, (time.perf_counter() - started) * 1000)
         raise
-    logger.info(
-        "HTTP IN <- %s %s status=%s duration_ms=%.1f",
-        request.method,
-        url,
-        response.status_code,
-        (time.perf_counter() - started) * 1000,
-    )
+    # Avoid drowning Grafana Loki with / healthcheck pings every 30s
+    if request.url.path not in ("/", "/health", "/favicon.ico"):
+        logger.info(
+            "HTTP IN <- %s %s status=%s duration_ms=%.1f",
+            request.method,
+            url,
+            response.status_code,
+            (time.perf_counter() - started) * 1000,
+        )
     return response
 
 
@@ -563,9 +571,10 @@ def format_network_strength(rssi: Optional[int]) -> str:
 def log_network_event(event_type: str, device_id: str, ip: str = None, ssid: str = None, rssi: int = None, reason: str = ""):
     """Output high-visibility, crystal-clear network event log to backend terminal."""
     is_connected = event_type.upper() in ("WIFI_CONNECTED", "CONNECTED", "WIFI_UP", "UP")
+    is_standby = event_type.upper() in ("STANDBY", "SLEEP", "WIFI_STANDBY")
     ssid_str = ssid or "TFTus-WiFi"
-    ip_str = ip or ("192.168.50.96" if is_connected else "None (Interface Dropped)")
-    strength_str = format_network_strength(rssi if rssi is not None else (-48 if is_connected else -100))
+    ip_str = ip or ("192.168.50.96" if (is_connected or is_standby) else "None (Interface Dropped)")
+    strength_str = format_network_strength(rssi if rssi is not None else (-48 if (is_connected or is_standby) else -100))
 
     if is_connected:
         banner = (
@@ -581,6 +590,20 @@ def log_network_event(event_type: str, device_id: str, ip: str = None, ssid: str
             f" • Grafana Stream  : Synced -> https://monitoring.yhealth.me/d/ad7r252?var-device_id={device_id}\n"
             f"{'='*78}"
         )
+    elif is_standby:
+        banner = (
+            f"\n{'='*78}\n"
+            f"🌙 [NETWORK LOG] DEVICE ENTERED STANDBY / SLEEP (Status: STANDBY)\n"
+            f"{'-'*78}\n"
+            f" • Device ID       : {device_id}\n"
+            f" • Last Known IP   : {ip_str}\n"
+            f" • Wi-Fi SSID      : '{ssid_str}'\n"
+            f" • Mode State      : Standby (Wi-Fi ON • WebSocket Halted)\n"
+            f" • Local Mic       : Active (Listening for 'Hello Assistant' / 'LIRA')\n"
+            f" • Disconnect Info : {reason or 'Inactivity Standby (2m halt)'}\n"
+            f" • Grafana Alert   : Synced -> https://monitoring.yhealth.me/d/ad7r252?var-device_id={device_id}\n"
+            f"{'='*78}"
+        )
     else:
         banner = (
             f"\n{'='*78}\n"
@@ -590,8 +613,8 @@ def log_network_event(event_type: str, device_id: str, ip: str = None, ssid: str
             f" • Last Known IP   : {ip_str}\n"
             f" • Wi-Fi SSID      : '{ssid_str}'\n"
             f" • Signal Strength : 0 dBm (No Carrier)\n"
-            f" • Disconnect Info : {reason or 'WebSocket Closed / Inactivity Standby (2m halt)'}\n"
-            f" • Power State     : Device Entered Standby / Power Saving Sleep\n"
+            f" • Disconnect Info : {reason or 'Connection Closed / Power Loss'}\n"
+            f" • Power State     : Offline (No Carrier)\n"
             f" • Grafana Alert   : Synced -> https://monitoring.yhealth.me/d/ad7r252?var-device_id={device_id}\n"
             f"{'='*78}"
         )
@@ -604,15 +627,17 @@ def _mark_device_status_in_fleet(device_label: str, status: str = "online", reas
     try:
         with open(_FLEET_DB_FILE, "r", encoding="utf-8") as f:
             speakers = json.load(f)
-        clean = re.sub(r"[^0-9A-Fa-f]", "", device_label).lower()
+        clean_id = device_label.strip().upper()
+        clean_mac = re.sub(r"[^0-9A-Fa-f]", "", device_label).upper()
         changed = False
         target_device_id = None
         for s in speakers:
-            spk_mac = re.sub(r"[^0-9A-Fa-f]", "", s.get("mac_address", "")).lower()
-            if spk_mac == clean or s.get("device_id", "").lower() == clean:
+            spk_id = s.get("device_id", "").strip().upper()
+            spk_mac = re.sub(r"[^0-9A-Fa-f]", "", s.get("mac_address", "")).upper()
+            if spk_id == clean_id or (len(clean_mac) == 12 and spk_mac == clean_mac):
                 s["status"] = status
                 s["wifi_connected"] = wifi_connected
-                s["status_reason"] = reason or ("WebSocket Live Connected" if status == "online" else "WebSocket Idle Standby (2m halt)")
+                s["status_reason"] = reason or ("WebSocket Live Connected" if status == "online" else "Standby Mode (Wi-Fi ON • Mic Listening)")
                 if ip:
                     s["ip_address"] = ip
                 if ssid:
@@ -665,6 +690,22 @@ async def _notify_fleet_status(device_id: str, status: str, wifi_connected: bool
         pass
 
 
+async def _notify_fleet_conversation(device_id: str, user_text: str, assistant_text: str, doctor_id: str = ""):
+    """Relay full conversation turns to the fleet dashboard and Grafana log stream."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                f"http://127.0.0.1:8010/api/speakers/{device_id}/conversation",
+                json={
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "doctor_id": doctor_id
+                }
+            )
+    except Exception:
+        pass
+
+
 def _mark_device_online_in_fleet(device_label: str, ip: str = None, ssid: str = None, rssi: int = None):
     _mark_device_status_in_fleet(device_label, "online", "Wake Word Triggered / WebSocket Live Active", True, ip=ip, ssid=ssid, rssi=rssi)
 
@@ -673,8 +714,8 @@ def _mark_device_offline_in_fleet(device_label: str, reason: str = "WebSocket Di
     _mark_device_status_in_fleet(device_label, "offline", reason, False, ip=ip, ssid=ssid, rssi=0)
 
 
-def _mark_device_standby_in_fleet(device_label: str):
-    _mark_device_status_in_fleet(device_label, "offline", "WebSocket Disconnected", False)
+def _mark_device_standby_in_fleet(device_label: str, ip: str = None, ssid: str = None, rssi: int = None):
+    _mark_device_status_in_fleet(device_label, "standby", "Standby Mode (Wi-Fi ON • WebSocket Halted • Mic Active)", True, ip=ip, ssid=ssid, rssi=rssi)
 
 
 ACTIVE_ESP_CONNECTIONS: dict = {}
@@ -713,9 +754,89 @@ async def get_ecosystem_stats():
     }
 
 
+@app.post("/api/speakers/{target_id}/speak")
+async def trigger_speaker_voice_announcement(target_id: str, payload: dict = Body(default={})):
+    """
+    Speaks an arbitrary sentence aloud on the physical hardware speaker via WebSocket PCM stream.
+    Zero disruption to Gemini Live sessions or sleep/standby logic.
+    """
+    clean_target = re.sub(r"[^0-9a-fA-F]", "", target_id).lower()
+    text = payload.get("message") or payload.get("text") or "Central dashboard ping test."
+
+    target_conn = None
+    for cid, conn in list(ACTIVE_ESP_CONNECTIONS.items()):
+        dev_label = re.sub(r"[^0-9a-fA-F]", "", str(conn.get("device_label", ""))).lower()
+        if (clean_target and (clean_target in dev_label or dev_label in clean_target)) or (target_id.lower() == str(conn.get("device_label", "")).lower()):
+            target_conn = conn
+            break
+
+    if not target_conn and len(ACTIVE_ESP_CONNECTIONS) == 1:
+        target_conn = next(iter(ACTIVE_ESP_CONNECTIONS.values()))
+
+    if not target_conn:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Speaker '{target_id}' has no active audio session (device may be in Standby or Offline)"
+        )
+
+    speak_fn = target_conn.get("speak_fn")
+    if not speak_fn:
+        raise HTTPException(status_code=503, detail="Speaker voice audio pipeline is still initializing")
+
+    # Schedule speech task asynchronously so the caller receives immediate acknowledgement
+    asyncio.create_task(speak_fn(text))
+    logger.info(f"🔊 Spoken announcement scheduled for '{target_conn.get('device_label')}': '{text[:40]}...'")
+    return {
+        "status": "spoken",
+        "device_label": target_conn.get("device_label"),
+        "text": text,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 
-# ==========================================================
+@app.post("/api/speakers/{target_id}/volume")
+async def set_speaker_hardware_volume(target_id: str, payload: dict = Body(default={})):
+    """
+    Sends real-time volume adjustment down the WebSocket to the physical ESP32 speaker.
+    Sets the hardware amplifier gain and visual LED VU meter immediately.
+    """
+    vol = max(0, min(100, int(payload.get("volume", 75))))
+    clean_target = re.sub(r"[^0-9a-fA-F]", "", target_id).lower()
+
+    target_conn = None
+    for cid, conn in list(ACTIVE_ESP_CONNECTIONS.items()):
+        dev_label = re.sub(r"[^0-9a-fA-F]", "", str(conn.get("device_label", ""))).lower()
+        if (clean_target and (clean_target in dev_label or dev_label in clean_target)) or (target_id.lower() == str(conn.get("device_label", "")).lower()):
+            target_conn = conn
+            break
+
+    if not target_conn and len(ACTIVE_ESP_CONNECTIONS) == 1:
+        target_conn = next(iter(ACTIVE_ESP_CONNECTIONS.values()))
+
+    if not target_conn:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Speaker '{target_id}' has no active WebSocket connection"
+        )
+
+    ws = target_conn.get("websocket")
+    if not ws:
+        raise HTTPException(status_code=503, detail="Speaker WebSocket is not ready")
+
+    try:
+        await ws.send_text(json.dumps({"type": "set_volume", "volume": vol}))
+        logger.info(f"🔊 [HARDWARE_VOLUME] Sent volume={vol}% down WebSocket to '{target_conn.get('device_label')}'")
+    except Exception as e:
+        logger.warning(f"Error sending volume to speaker: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "status": "volume_dispatched",
+        "device_label": target_conn.get("device_label"),
+        "volume": vol,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
 # PERSONA HELPERS
 # ==========================================================
 _DROP_KEYS = {
@@ -1057,6 +1178,7 @@ def build_doctor_agent_prompt(
         "- TODAY'S SCHEDULE: When asked about appointments, summarize from TODAY'S SCHEDULE in 1-2 sentences. Call get_doctor_consultations for date queries.\n"
         "- CLINICAL NOTES: Repeat note back once for confirmation, call add_clinical_note, then say: 'Note saved.'\n"
         "- ALERTS: Confirm alert type, call escalate_alert, then say: 'Alert sent.'\n"
+        "- SILENCE & LISTENING CADENCE: Stay quietly in listening mode whenever the doctor is silent, thinking, pausing, or not addressing you. NEVER say 'I could not hear', 'Maaf kijiye', 'Sun nahi paaya', or ask to repeat during silence or ambient background noise. ONLY speak when the doctor explicitly addresses you or asks a clinical question. If the doctor explicitly spoke a question or patient name but it was genuinely indistinct, ask for clarification in 1 short polite sentence.\n"
         "- SIGN-OFF: When the user says goodbye or wants to conclude/end the session (e.g. 'goodbye', 'bye', 'see you', 'see you later', 'stop', 'go to sleep', 'thank you bye'), call end_conversation immediately, give one brief warm sign-off (e.g. 'Goodbye Doctor, have a great day!') and stop.\n\n"
         "DOCTOR CONTEXT & REAL-TIME CLOCK:\n"
         f"Name: Dr. {doctor_name}\n"
@@ -2293,7 +2415,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         "wifi_rssi": rssi_val,
         "connected_at": datetime.now(timezone.utc).isoformat(),
         "status": "online",
-        "wifi_connected": True
+        "wifi_connected": True,
+        "websocket": websocket
     }
 
     api_key = os.getenv("GEMINI_API_KEY")
@@ -2347,6 +2470,14 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         doctor_persona = await async_fetch_doctor_persona(doctor_id, today_str)
         system_prompt = build_doctor_agent_prompt(doctor_persona=doctor_persona)
 
+# Dynamic Voice Biometrics Enrollment Lookup (HALTED / ARCHIVED)
+    # Voice signature checking is temporarily bypassed while focusing on core modes/connectivity features.
+    enrolled_doctor_voiceprint = None
+    if enrolled_doctor_voiceprint and enrolled_doctor_voiceprint.get("biometrics_active"):
+        bound_dev = enrolled_doctor_voiceprint.get('device_id') or connection_label
+        bound_doc = enrolled_doctor_voiceprint.get('doctor_name') or doctor_id
+        logger.info(f"🛡️ [Voice Biometrics Active] Hardware Gatekeeper locked: Device {bound_dev} -> Physician {bound_doc} (F0: {enrolled_doctor_voiceprint.get('f0_pitch')} Hz)")
+
     def make_config(use_advanced: bool):
         kwargs = dict(
             response_modalities=["AUDIO"],
@@ -2394,6 +2525,8 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         "last_rx": loop.time(),
         "suppress_output": False,  # set by a device barge-in until Gemini ends the old turn
         "conversation_ended": False,
+        "voiceprint_verified": False if (enrolled_doctor_voiceprint and enrolled_doctor_voiceprint.get("biometrics_active")) else True,
+        "biometric_pcm_buf": bytearray(),
     }
 
     last_queue_full_log = 0.0
@@ -2580,6 +2713,52 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                         else:
                             consecutive_quiet_chunks = 0
 
+                        # --- REAL-TIME BIOMETRIC VOICE SIGNATURING GATEKEEPER ---
+                        if enrolled_doctor_voiceprint and not S["voiceprint_verified"]:
+                            S["biometric_pcm_buf"].extend(pcm)
+                            # Analyze ~600ms (19,200 bytes of 16kHz 16-bit mono) of live utterance for reliable pitch & MFCC
+                            if len(S["biometric_pcm_buf"]) >= 19200:
+                                test_vp = extract_voiceprint(bytes(S["biometric_pcm_buf"]))
+                                is_match, score, details = verify_speaker_match(test_vp, enrolled_doctor_voiceprint, threshold=0.65)
+                                if is_match:
+                                    S["voiceprint_verified"] = True
+                                    logger.info(f"✅ [BIOMETRIC MATCH] Verified authorized physician {doctor_id} (Score: {score}) | Details: {details}")
+                                    await ws_send_json({"event": "biometric_status", "status": "verified", "score": score, "doctor_id": doctor_id})
+                                    # Forward the verified initial buffered audio to Gemini so first words are never lost
+                                    buffered_pcm = bytes(S["biometric_pcm_buf"])
+                                    S["biometric_pcm_buf"].clear()
+                                    boosted_buffered = boost_chunk_gain(buffered_pcm)
+                                    audio_bytes += len(boosted_buffered)
+                                    last_audio_t, streaming = loop.time(), True
+                                    await queue_put(("audio", boosted_buffered))
+                                else:
+                                    thresh = details.get('threshold', 0.65)
+                                    logger.warning(f"🚫 [SECURITY ALERT] Unauthorized speaker blocked! Score: {score} < {thresh} | Details: {details}")
+                                    await ws_send_json({"event": "biometric_status", "status": "rejected", "score": score, "reason": "unauthorized_voice_signature"})
+                                    try:
+                                        async with httpx.AsyncClient(timeout=1.5) as aclient:
+                                            await aclient.post("http://127.0.0.1:8010/api/audit-logs", json={
+                                                "admin_user": "Hardware Biometric Gatekeeper",
+                                                "action": "UNAUTHORIZED_VOICE_ACCESS_BLOCKED",
+                                                "device_id": connection_label,
+                                                "details": f"Consultation access blocked: Unrecognized speaker voice detected (Biometric score: {score}, pitch delta: {details.get('f0_diff_hz')} Hz). Audio dropped before reaching Gemini."
+                                            })
+                                    except Exception:
+                                        pass
+                                    # Anti-overlap debounce: Speak announcement at most once per 6 seconds
+                                    now_t = loop.time()
+                                    if now_t - S.get("last_reject_announce_t", 0.0) > 6.0:
+                                        S["last_reject_announce_t"] = now_t
+                                        doc_display = enrolled_doctor_voiceprint.get("doctor_name", "Dr. Makkar")
+                                        asyncio.create_task(speak_status_announcement(
+                                            f"Access restricted. Voice signature does not match authorized physician {doc_display}."
+                                        ))
+                                    S["biometric_pcm_buf"].clear()
+                                    continue
+
+                        if enrolled_doctor_voiceprint and not S["voiceprint_verified"]:
+                            continue
+
                         last_audio_t, streaming = loop.time(), True
                         boosted = boost_chunk_gain(pcm)
                         audio_bytes += len(boosted)
@@ -2600,7 +2779,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                             user_text = ""
                         if user_text:
                             logger.info(f"🎤 [Doctor Spoke / Wake Word]: '{user_text}'")
-                            if quota_waiting or not gemini_has_been_active or S.get("gemini_error"):
+                            if quota_waiting or S.get("gemini_error"):
                                 asyncio.create_task(process_fallback_utterance(user_text))
                             else:
                                 await queue_put(("text", user_text))
@@ -2617,7 +2796,40 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                         streaming = False
                         logger.info(f"🎤 [Utterance end] {audio_bytes} bytes")
                         audio_bytes = 0
+                        # Reset per-turn verification so EVERY subsequent question is individually authenticated
+                        if enrolled_doctor_voiceprint:
+                            S["voiceprint_verified"] = False
+                            S["biometric_pcm_buf"].clear()
                         await queue_put(("turn_end", None))
+                    elif "sleep" in text or "standby" in text:
+                        streaming = False
+                        S["in_standby"] = True
+                        if enrolled_doctor_voiceprint:
+                            S["voiceprint_verified"] = False
+                            S["biometric_pcm_buf"].clear()
+                        logger.info(f"🌙 [Device Standby Event]: '{text}'")
+                        _mark_device_standby_in_fleet(connection_label, ip=client_ip, ssid=supplied_ssid, rssi=rssi_val)
+                    elif "heartbeat" in text:
+                        try:
+                            hb_data = json.loads(text)
+                            h_rssi = hb_data.get("rssi")
+                            h_heap = hb_data.get("heap")
+                            if h_rssi is not None:
+                                rssi_val = h_rssi
+                            async with httpx.AsyncClient(timeout=1.5) as hclient:
+                                await hclient.post(
+                                    f"http://127.0.0.1:8010/api/speakers/{connection_label}/heartbeat",
+                                    json={
+                                        "status": "online",
+                                        "wifi_connected": True,
+                                        "rssi": h_rssi,
+                                        "heap": h_heap,
+                                        "ip": client_ip,
+                                        "ssid": supplied_ssid
+                                    }
+                                )
+                        except Exception:
+                            pass
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -2660,6 +2872,10 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
             S["is_speaking"] = previous_speaking_state if progress else False
             S["last_activity"] = loop.time()
         return True
+
+    # Register speak handler in live active connections for dynamic dashboard paging
+    if connection_id in ACTIVE_ESP_CONNECTIONS:
+        ACTIVE_ESP_CONNECTIONS[connection_id]["speak_fn"] = speak_status_announcement
 
     backoff, fail_count = 1.0, 0
     target_model = FALLBACK_LIVE_MODELS[0]
@@ -2732,8 +2948,10 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                     if response.tool_call is not None:
                                         S["is_speaking"] = True
                                         frs = []
+                                        speaker_dev_id = matched_speaker.get("device_id", connection_label) if matched_speaker else connection_label
                                         for call in response.tool_call.function_calls:
                                             call_args = dict(call.args or {})
+                                            logger.info(f"🛠️ [TOOL CALL] Device: {speaker_dev_id} ({connection_label}) | Name: '{call.name}' | Args: {call_args}")
                                             await ws_send_json({"event": "tool_call", "name": call.name, "args": call_args})
                                             S["tool_in_progress"] = True
                                             S["tool_in_progress_since"] = loop.time()
@@ -2765,6 +2983,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                             finally:
                                                 S["tool_in_progress"] = False
                                                 S["tool_in_progress_since"] = 0.0
+                                            logger.info(f"🛠️ [TOOL RESULT] Device: {speaker_dev_id} ({connection_label}) | Name: '{call.name}' | Status: '{result.get('status', 'done')}'")
                                             await ws_send_json({"event": "tool_result", "name": call.name, "result": result})
                                             frs.append(types.FunctionResponse(name=call.name, id=call.id, response=result))
                                         try:
@@ -2789,6 +3008,7 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
 
                                     if sc.model_turn is not None:
                                         unclear_streak = 0
+                                        S["turn_pending"] = False
                                         if not S["suppress_output"]:
                                             S["is_speaking"] = True
                                             for part in (sc.model_turn.parts or []):
@@ -2809,35 +3029,50 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                         if S["suppress_output"]:
                                             S["suppress_output"] = False
                                             logger.info("✅ Gemini acknowledged the device interrupt")
-                                        if sc.turn_complete:
-                                            # Only a completed Gemini turn proves that quota
-                                            # access recovered; reconnect success alone does not.
-                                            restart_notice_sent = False
-                                            quota_notice_sent = False
-                                            quota_waiting = False
-                                            unclear_streak = 0
-                                            S["turn_pending"] = False
-                                            S["pending_tool_failure_notice"] = None
-                                            # Track and log token usage (Document Section 5)
-                                            usage = getattr(response, "usage_metadata", None)
-                                            if usage:
-                                                p_tok = getattr(usage, "prompt_token_count", 0) or 0
-                                                c_tok = getattr(usage, "candidates_token_count", 0) or 0
-                                                t_tok = getattr(usage, "total_token_count", 0) or (p_tok + c_tok)
-                                                if p_tok or c_tok:
-                                                    _runtime_metrics["total_prompt_tokens"] = _runtime_metrics.get("total_prompt_tokens", 0) + p_tok
-                                                    _runtime_metrics["total_candidate_tokens"] = _runtime_metrics.get("total_candidate_tokens", 0) + c_tok
-                                                    _runtime_metrics["total_turns"] = _runtime_metrics.get("total_turns", 0) + 1
-                                                    _runtime_metrics["last_turn_tokens"] = {"prompt": p_tok, "candidates": c_tok, "total": t_tok}
-                                                    logger.info(f"📊 [Token Metrics] Prompt: {p_tok} | Generated: {c_tok} | Turn Total: {t_tok}")
-                                        if in_txt:
-                                            full_user = ''.join(in_txt).strip()
-                                            logger.info(f" 🎤 Doctor: {full_user}")
+                                    if sc.turn_complete:
+                                        # Only a completed Gemini turn proves that quota
+                                        # access recovered; reconnect success alone does not.
+                                        restart_notice_sent = False
+                                        quota_notice_sent = False
+                                        quota_waiting = False
+                                        # Reset biometric gatekeeper so the next utterance is strictly verified
+                                        if enrolled_doctor_voiceprint:
+                                            S["voiceprint_verified"] = False
+                                            S["biometric_pcm_buf"].clear()
+                                        unclear_streak = 0
+                                        S["turn_pending"] = False
+                                        S["pending_tool_failure_notice"] = None
+                                        # Track and log token usage (Document Section 5)
+                                        usage = getattr(response, "usage_metadata", None)
+                                        if usage:
+                                            p_tok = getattr(usage, "prompt_token_count", 0) or 0
+                                            c_tok = getattr(usage, "candidates_token_count", 0) or 0
+                                            t_tok = getattr(usage, "total_token_count", 0) or (p_tok + c_tok)
+                                            if p_tok or c_tok:
+                                                _runtime_metrics["total_prompt_tokens"] = _runtime_metrics.get("total_prompt_tokens", 0) + p_tok
+                                                _runtime_metrics["total_candidate_tokens"] = _runtime_metrics.get("total_candidate_tokens", 0) + c_tok
+                                                _runtime_metrics["total_turns"] = _runtime_metrics.get("total_turns", 0) + 1
+                                                _runtime_metrics["last_turn_tokens"] = {"prompt": p_tok, "candidates": c_tok, "total": t_tok}
+                                                logger.info(f"📊 [Token Metrics] Prompt: {p_tok} | Generated: {c_tok} | Turn Total: {t_tok}")
+                                        speaker_dev_id = matched_speaker.get("device_id", connection_label) if matched_speaker else connection_label
+                                        formatted_mac = ":".join(connection_label[i:i+2] for i in range(0, len(connection_label), 2)).upper() if len(connection_label) == 12 else connection_label
+                                        full_user = ''.join(in_txt).strip() if in_txt else ""
+                                        full_asst = ''.join(out_txt).strip() if out_txt else ""
+
+                                        if full_user:
+                                            logger.info(f"💬 [CONVERSATION TURN] Device: {speaker_dev_id} | MAC: {formatted_mac} ({connection_label}) | 🎤 Doctor: \"{full_user}\"")
                                             await ws_send_json({"event": "turn_text", "role": "user", "text": full_user})
-                                        if out_txt:
-                                            full_asst = ''.join(out_txt).strip()
-                                            logger.info(f" 🗣️ Assistant: {full_asst}")
+                                        if full_asst:
+                                            logger.info(f"💬 [CONVERSATION TURN] Device: {speaker_dev_id} | MAC: {formatted_mac} ({connection_label}) | 🗣️ Assistant: \"{full_asst}\"")
                                             await ws_send_json({"event": "turn_text", "role": "assistant", "text": full_asst})
+
+                                        if full_user or full_asst:
+                                            loop.create_task(_notify_fleet_conversation(
+                                                device_id=speaker_dev_id,
+                                                user_text=full_user,
+                                                assistant_text=full_asst,
+                                                doctor_id=doctor_id
+                                            ))
                                         in_txt, out_txt = [], []
 
                                         tail = resampler.flush()
@@ -2850,10 +3085,11 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                                         else:
                                             S["mute_until"] = 0.0
                                         S["last_activity"] = loop.time()
-                                        logger.info(f"✅ [Turn {'Interrupted' if sc.interrupted else 'Complete'}] "
+                                        logger.info(f"✅ [Turn {'Interrupted' if sc.interrupted else 'Complete'}] Device: {speaker_dev_id} "
                                                     f"(~{max(0.0, S['play_end'] - loop.time()):.1f}s of audio still playing on device)")
                                         await asyncio.sleep(0.03)
                                         if sc.turn_complete and S["end_after_turn"]:
+                                            logger.info(f"🛑 [CONVERSATION END] Device: {speaker_dev_id} ({connection_label}) | Completed doctor goodbye sign-off.")
                                             if not await ws_send_json({"event": "conversation_end"}):
                                                 return
                                             S["end_after_turn"] = False
@@ -2909,34 +3145,15 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
                             if (S["turn_pending"] and not S["tool_in_progress"]
                                     and loop.time() - S["last_rx"] > (
                                         8.0 if S["pending_tool_failure_notice"]
-                                        else UNCLEAR_SPEECH_TIMEOUT_S
+                                        else 5.0
                                     )):
-                                unclear_streak += 1
-                                if unclear_streak < MAX_UNCLEAR_STREAK:
-                                    salutation = "Dr. Makkar" if "Makkar" in DEFAULT_DOCTOR_NAME else f"Dr. {DEFAULT_DOCTOR_NAME}"
-                                    logger.info(
-                                        "Doctor utterance indistinct (no Gemini progress in %.1fs). Nudging Gemini to warmly ask to repeat (attempt %d/%d)...",
-                                        UNCLEAR_SPEECH_TIMEOUT_S, unclear_streak, MAX_UNCLEAR_STREAK,
-                                    )
-                                    try:
-                                        # Nudge Gemini Live to speak the clarification directly in its native voice (single voice, no duplication)
-                                        await session.send_realtime_input(
-                                            text=f"The doctor's previous phrase was indistinct or inaudible. In one warm, natural sentence with polite Indian inflection, politely ask {salutation} to repeat."
-                                        )
-                                        S["last_rx"] = loop.time()
-                                    except Exception as ctx_err:
-                                        logger.warning(f"Could not nudge Gemini ({ctx_err}); using fallback announcement")
-                                        S["turn_pending"] = False
-                                        await speak_status_announcement(f"Sorry, I didn't quite catch that, {salutation}. Could you please repeat?")
-                                    continue
+                                if S["pending_tool_failure_notice"]:
+                                    await speak_status_announcement(S["pending_tool_failure_notice"])
+                                    S["pending_tool_failure_notice"] = None
                                 else:
-                                    logger.warning(
-                                        "Gemini made no progress for %d consecutive turns; reconnecting",
-                                        MAX_UNCLEAR_STREAK,
-                                    )
-                                    S["turn_pending"] = False
-                                    S["gemini_error"] = TimeoutError("Gemini made no progress on the active turn")
-                                    break
+                                    logger.info("Doctor is silent / ambient pause detected; remaining quietly in listening mode.")
+                                S["turn_pending"] = False
+                                unclear_streak = 0
 
                             try:
                                 kind, data = await asyncio.wait_for(audio_queue.get(), timeout=0.25)
@@ -3046,15 +3263,37 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str = "default
         await asyncio.gather(esp32_task, return_exceptions=True)
         ACTIVE_ESP_CONNECTIONS.pop(connection_id, None)
 
-        # ⚠️ LOG PROMINENT NETWORK WI-FI DISCONNECTED BANNER TO BACKEND CONSOLE
-        log_network_event("WIFI_DISCONNECTED", device_id=connection_label, ip=client_ip, ssid=supplied_ssid, reason="WebSocket Closed / Inactivity Standby (2m halt)")
-        _mark_device_offline_in_fleet(connection_label, "WebSocket Disconnected", ip=client_ip, ssid=supplied_ssid)
+        # In our architecture, closing the WebSocket is the definition of STANDBY / SLEEP mode
+        # (Wi-Fi router link remains active, mic scans locally for wakeword, WebSocket is halted).
+        # We transition to Standby mode; the fleet watchdog will only mark offline if Wi-Fi link drops.
+        reason_desc = "Spoken Goodbye / Inactivity Standby (Wi-Fi Active)" if (S.get("conversation_ended") or S.get("in_standby")) else "WebSocket Halted • Standby Mode (Wi-Fi Active)"
+        log_network_event("STANDBY", device_id=connection_label, ip=client_ip, ssid=supplied_ssid, reason=reason_desc)
+        _mark_device_standby_in_fleet(connection_label, ip=client_ip, ssid=supplied_ssid, rssi=rssi_val)
 
     logger.info(f"🔴 WebSocket session fully closed (session_id='{session_id}')")
 
 
 if __name__ == "__main__":
     import uvicorn
+    import subprocess
     port = int(os.getenv("PORT", 8008))
+
+    # Auto-free port if another stale instance is still holding it (Eliminates Errno 10048)
+    try:
+        current_pid = os.getpid()
+        cmd = f'netstat -aon | findstr ":{port}" | findstr "LISTENING"'
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        for line in res.stdout.strip().splitlines():
+            tokens = line.strip().split()
+            if tokens:
+                owner_pid = int(tokens[-1])
+                if owner_pid != current_pid and owner_pid > 0:
+                    logger.info(f"⚡ Port {port} held by stale process {owner_pid}. Auto-terminating...")
+                    subprocess.run(f"taskkill /F /PID {owner_pid}", shell=True, capture_output=True)
+                    time.sleep(0.6)
+    except Exception as e:
+        logger.debug(f"Port clear check: {e}")
+
     logger.info(f"Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port, ws_ping_interval=20.0, ws_ping_timeout=20.0, timeout_keep_alive=600)
+
