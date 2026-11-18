@@ -28,9 +28,9 @@ static int s_retry_num = 0;
 static int s_ap_index =
     0; // 0: Primary (TFTus-WiFi), 1: 2.4G (TFTus-WiFi), 2: Alt (TFTus-WiFi)
 
-static const char *s_ssids[] = {WIFI_SSID_PRIMARY, WIFI_SSID_2G, WIFI_SSID_ALT};
+static const char *s_ssids[] = {WIFI_SSID_PRIMARY, WIFI_SSID_PRIMARY, WIFI_SSID_PRIMARY};
 static const char *s_passes[] = {WIFI_PASS_PRIMARY, WIFI_PASS_PRIMARY,
-                                 WIFI_PASS_ALT};
+                                 WIFI_PASS_PRIMARY};
 
 static void switch_to_next_ap(void) {
   // If custom Wi-Fi credentials were provisioned via USB/NVS and failed, launch Captive Portal!
@@ -55,7 +55,7 @@ static void switch_to_next_ap(void) {
           sizeof(wifi_config.sta.ssid));
   strncpy((char *)wifi_config.sta.password, s_passes[s_ap_index],
           sizeof(wifi_config.sta.password));
-  wifi_config.sta.scan_method = WIFI_FAST_SCAN;
+  wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
   wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
   wifi_config.sta.threshold.authmode =
       (strlen(s_passes[s_ap_index]) > 0) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
@@ -140,7 +140,7 @@ esp_err_t wifi_init_sta(void) {
   wifi_config_t wifi_config = {
       .sta =
           {
-              .scan_method = WIFI_FAST_SCAN,
+              .scan_method = WIFI_ALL_CHANNEL_SCAN,
               .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
               .threshold.authmode = WIFI_AUTH_WPA2_PSK,
               .pmf_cfg =

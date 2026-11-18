@@ -33,6 +33,7 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+flash_monitor_com*.bat
 
 # Node / Frontend Artifacts
 node_modules/

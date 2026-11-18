@@ -16,12 +16,12 @@ extern "C" {
 // 3. (Optional) Set CLINIC_HOTSPOT_SSID to the doctor's phone hotspot as backup.
 // ============================================================================
 
-#define CLINIC_WIFI_SSID     "TFTus-WiFi"        // <-- Put Clinic Wi-Fi Name (SSID)
-#define CLINIC_WIFI_PASSWORD "TFTus@123#$"       // <-- Put Clinic Wi-Fi Password
+#define CLINIC_WIFI_SSID     "iPhone"        // <-- Put Clinic Wi-Fi Name (SSID)
+#define CLINIC_WIFI_PASSWORD "12348741"       // <-- Put Clinic Wi-Fi Password
 
-// Backup / Fallback Network (e.g., Doctor's Mobile Hotspot if clinic Wi-Fi drops)
-#define CLINIC_HOTSPOT_SSID  "TFTus-WiFi"        // <-- Mobile Hotspot or Backup Wi-Fi
-#define CLINIC_HOTSPOT_PASS  "TFTus@123#$"       // <-- Backup Wi-Fi Password
+// Backup / Fallback Network
+#define CLINIC_HOTSPOT_SSID  "iPhone"        // <-- Mobile Hotspot
+#define CLINIC_HOTSPOT_PASS  "12348741"       // <-- Mobile Hotspot Password
 
 // ============================================================================
 // Automatic Macro Resolution

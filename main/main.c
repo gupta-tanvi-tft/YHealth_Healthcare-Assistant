@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "esp_sntp.h"
 
 static const char *TAG = "GEMINI_ASSISTANT";
 
@@ -49,12 +51,11 @@ static bool s_has_nvs_server       = false;
 #define CHUNK_MONO_BYTES (CHUNK_SAMPLES * sizeof(int16_t))
 
 #define VAD_WAKE_THRESHOLD_RMS 100.0f  // start a session
-#define VAD_ACTIVE_THRESHOLD_RMS 80.0f // "user is talking"
+#define VAD_ACTIVE_THRESHOLD_RMS 60.0f // "user is talking" (captures soft voice & consonants)
 #define WAKE_CONFIRM_CHUNKS                                                    \
   2 // need 2 loud chunks (~64 ms) so clicks don't wake us
 #define MIN_SPEECH_DURATION_MS 200 // ignore blips shorter than this
-#define SILENCE_TIMEOUT_MS                                                     \
-  350 // trailing silence => utterance finished (low latency 350ms)
+#define SILENCE_TIMEOUT_MS 800     // trailing silence => natural human conversational pause
 #define IDLE_STANDBY_TIMEOUT_S 120 // 2 minutes inactivity => Sleep / Standby
 #define INACTIVITY_SLEEP_TIMEOUT_S                                             \
   120 // 2 minutes (120 s) => Disconnect & Sleep
@@ -65,13 +66,11 @@ static bool s_has_nvs_server       = false;
   200.0f // deliberate speech while the speaker is active
 #define BARGE_IN_CONFIRM_CHUNKS 5 // 160 ms confirms barge-in speech
 
-// Playback
-#define PLAYBACK_RB_SIZE 65536 // 2.0 s of 16 kHz mono s16
-#define PLAYBACK_PREBUFFER_BYTES                                               \
-  3200 // 100 ms cushion before (re)starting playback for fast response
-#define PLAYBACK_STALL_TIMEOUT_MS 6000 // tolerate tool-call gaps mid-turn
-#define PLAYBACK_TAIL_FLUSH_MS                                                 \
-  250 // play a short tail even if turn_complete is late
+// Playback (matched to commit 31bb570 with jitter-free buffering)
+#define PLAYBACK_RB_SIZE          65536 // 2.0 s of 16 kHz mono s16
+#define PLAYBACK_PREBUFFER_BYTES  6400  // 200 ms cushion before (re)starting playback (matched to 31bb570)
+#define PLAYBACK_STALL_TIMEOUT_MS 6000  // Tolerate tool-call gaps mid-turn
+#define PLAYBACK_TAIL_FLUSH_MS    250   // Play short tail if turn_complete is late (matched to 31bb570)
 
 // ==========================================================
 // STATE
@@ -100,6 +99,7 @@ typedef struct {
 
 static esp_websocket_client_handle_t s_persistent_ws_client = NULL;
 static SemaphoreHandle_t s_ws_connect_mutex = NULL;
+static SemaphoreHandle_t s_ws_send_mutex = NULL;
 static volatile bool s_ws_connected = false;
 static ws_playback_ctx_t s_playback_ctx;
 static RingbufHandle_t s_audio_play_rb = NULL;
@@ -354,7 +354,10 @@ static void audio_playback_task(void *pvParameters) {
       bool have = buffered > 0;
       bool stale =
           have && ((now_ms() - s_last_audio_rx_ms) > PLAYBACK_TAIL_FLUSH_MS);
-      if (buffered >= PLAYBACK_PREBUFFER_BYTES ||
+      // At start of reply: wait for full 200ms cushion (6400B).
+      // Mid-reply recovery: resume immediately as soon as a chunk arrives (>=1024B).
+      size_t threshold = s_playback_ctx.is_playing ? 1024 : PLAYBACK_PREBUFFER_BYTES;
+      if (buffered >= threshold ||
           (have && (s_turn_complete || stale))) {
         s_is_prebuffering = false;
       } else {
@@ -371,6 +374,7 @@ static void audio_playback_task(void *pvParameters) {
     }
 
     size_t item_size = 0;
+    // Wait up to 100 ms (matched to 31bb570) so normal packet arrival never triggers a false underrun
     uint8_t *item = (uint8_t *)xRingbufferReceive(s_audio_play_rb, &item_size,
                                                   pdMS_TO_TICKS(100));
 
@@ -551,11 +555,18 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
       return ESP_OK;
     }
 
+    // Safely stop and destroy the client without race condition with send tasks
+    s_ws_connected = false;
+    if (s_ws_send_mutex) {
+      xSemaphoreTake(s_ws_send_mutex, pdMS_TO_TICKS(1000));
+    }
     ESP_LOGI(TAG, "Cleaning up inactive WebSocket client for immediate reconnect...");
     esp_websocket_client_stop(s_persistent_ws_client);
     esp_websocket_client_destroy(s_persistent_ws_client);
     s_persistent_ws_client = NULL;
-    s_ws_connected = false;
+    if (s_ws_send_mutex) {
+      xSemaphoreGive(s_ws_send_mutex);
+    }
   }
 
   wifi_ap_record_t ap_info = {0};
@@ -597,7 +608,7 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
       .ping_interval_sec = 0,
       .pingpong_timeout_sec = 0,
       .crt_bundle_attach = esp_crt_bundle_attach,
-      .skip_cert_common_name_check = true,
+      .skip_cert_common_name_check = false, // Must be false so SNI is sent for Cloudflare / TLS servers
       .headers = "ngrok-skip-browser-warning: 1\r\nUser-Agent: ESP32\r\n",
   };
 
@@ -613,13 +624,16 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
   esp_err_t err = esp_websocket_client_start(s_persistent_ws_client);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to start WebSocket: %s", esp_err_to_name(err));
+    if (s_ws_send_mutex) xSemaphoreTake(s_ws_send_mutex, pdMS_TO_TICKS(500));
     esp_websocket_client_destroy(s_persistent_ws_client);
     s_persistent_ws_client = NULL;
     s_ws_connected = false;
+    if (s_ws_send_mutex) xSemaphoreGive(s_ws_send_mutex);
     xSemaphoreGive(s_ws_connect_mutex);
     return err;
   }
-  for (int i = 0; !s_ws_connected && i < 100; i++)
+  // Allow up to 4.5 seconds for internet DNS and TLS handshake to complete cleanly
+  for (int i = 0; !s_ws_connected && i < 300; i++)
     vTaskDelay(pdMS_TO_TICKS(15));
   esp_err_t result = (s_ws_connected && s_persistent_ws_client)
                          ? ESP_OK
@@ -630,6 +644,28 @@ static esp_err_t ensure_websocket_connected(ws_playback_ctx_t *ctx) {
 
 static inline bool ws_ready(void) {
   return s_ws_connected && (s_persistent_ws_client != NULL);
+}
+
+static int safe_ws_send_text(const char *text, int len, TickType_t timeout) {
+  if (!s_ws_connected || !s_persistent_ws_client) return -1;
+  if (!s_ws_send_mutex || xSemaphoreTake(s_ws_send_mutex, timeout) != pdTRUE) return -1;
+  int ret = -1;
+  if (s_ws_connected && s_persistent_ws_client) {
+    ret = esp_websocket_client_send_text(s_persistent_ws_client, text, len, timeout);
+  }
+  xSemaphoreGive(s_ws_send_mutex);
+  return ret;
+}
+
+static int safe_ws_send_bin(const char *data, int len, TickType_t timeout) {
+  if (!s_ws_connected || !s_persistent_ws_client) return -1;
+  if (!s_ws_send_mutex || xSemaphoreTake(s_ws_send_mutex, timeout) != pdTRUE) return -1;
+  int ret = -1;
+  if (s_ws_connected && s_persistent_ws_client) {
+    ret = esp_websocket_client_send_bin(s_persistent_ws_client, data, len, timeout);
+  }
+  xSemaphoreGive(s_ws_send_mutex);
+  return ret;
 }
 
 static void maybe_send_pending_interrupt(void) {
@@ -643,8 +679,7 @@ static void maybe_send_pending_interrupt(void) {
       ESP_LOGW(TAG, "⏹️ WebSocket not ready – will retry on next reconnect");
       return; // keep pending_interrupt true so it will be retried later
     }
-    int res = esp_websocket_client_send_text(s_persistent_ws_client, interrupt,
-                                             len, pdMS_TO_TICKS(250));
+    int res = safe_ws_send_text(interrupt, len, pdMS_TO_TICKS(250));
     if (res >= 0) {
       ESP_LOGI(TAG, "📤 Pending interrupt sent successfully (%s)",
                pending_reason);
@@ -670,15 +705,21 @@ static void enter_sleep_mode(const char *reason) {
   if (s_persistent_ws_client && s_ws_connected) {
     char sleep_msg[96];
     snprintf(sleep_msg, sizeof(sleep_msg), "{\"type\":\"device_sleep\",\"reason\":\"%s\"}", reason ? reason : "standby");
-    esp_websocket_client_send_text(s_persistent_ws_client, sleep_msg, strlen(sleep_msg), pdMS_TO_TICKS(150));
+    safe_ws_send_text(sleep_msg, strlen(sleep_msg), pdMS_TO_TICKS(150));
     vTaskDelay(pdMS_TO_TICKS(150));
+  }
+  s_ws_connected = false;
+  if (s_ws_send_mutex) {
+    xSemaphoreTake(s_ws_send_mutex, pdMS_TO_TICKS(1000));
   }
   if (s_persistent_ws_client) {
     esp_websocket_client_stop(s_persistent_ws_client);
     esp_websocket_client_destroy(s_persistent_ws_client);
     s_persistent_ws_client = NULL;
   }
-  s_ws_connected = false;
+  if (s_ws_send_mutex) {
+    xSemaphoreGive(s_ws_send_mutex);
+  }
   flush_playback_ringbuffer();
 }
 
@@ -744,12 +785,12 @@ static void heartbeat_task(void *pvParameters) {
                ws_ok ? "ONLINE (Active Audio Link)" : "STANDBY (Reachable over LAN/WAN)");
 
       // If persistent WebSocket is ready, dispatch periodic heartbeat telemetry frame
-      if (ws_ok && s_persistent_ws_client) {
+      if (ws_ok) {
         char hb_payload[128];
         snprintf(hb_payload, sizeof(hb_payload),
                  "{\"event\":\"heartbeat\",\"device_id\":\"%s\",\"rssi\":%d,\"heap\":%lu}",
                  s_device_id, ap_info.rssi, (unsigned long)free_heap);
-        esp_websocket_client_send_text(s_persistent_ws_client, hb_payload, strlen(hb_payload), pdMS_TO_TICKS(100));
+        safe_ws_send_text(hb_payload, strlen(hb_payload), pdMS_TO_TICKS(100));
       }
     } else {
       ESP_LOGW(TAG, "⚠️ [HEARTBEAT] Wi-Fi Link: DISCONNECTED | Retrying AP connection...");
@@ -888,16 +929,15 @@ static void continuous_mic_stream_task(void *pvParameters) {
 
         s_conv_state = CONV_STATE_LISTENING;
         s_last_speech_time_ms = t;
+        s_pending_wake_event = true;
         update_led_state(CONV_STATE_LISTENING);
         if (pre_chunks > 0) {
           int off = (2 - pre_chunks) * chunk_samples;
-          esp_websocket_client_send_bin(
-              s_persistent_ws_client, (const char *)(preroll + off),
-              pre_chunks * CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
+          safe_ws_send_bin((const char *)(preroll + off),
+                           pre_chunks * CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
         }
-        esp_websocket_client_send_bin(s_persistent_ws_client,
-                                      (const char *)chunk_mono,
-                                      CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
+        safe_ws_send_bin((const char *)chunk_mono,
+                         CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000));
         speech_accum_ms = chunk_duration_ms * WAKE_CONFIRM_CHUNKS;
         silence_accum_ms = 0;
         pre_chunks = wake_hits = 0;
@@ -930,21 +970,19 @@ static void continuous_mic_stream_task(void *pvParameters) {
           if (s_pending_wake_event) {
             s_pending_wake_event = false;
             const char *wake_evt = "{\"event\":\"user_utterance\",\"text\":\"Hello assistant\"}";
-            esp_websocket_client_send_text(s_persistent_ws_client, wake_evt,
-                                           strlen(wake_evt), pdMS_TO_TICKS(300));
+            safe_ws_send_text(wake_evt, strlen(wake_evt), pdMS_TO_TICKS(300));
             ESP_LOGI(TAG, "📤 Dispatched wake utterance event to Gemini");
           }
           if (preconn_count > 0) {
             for (int p = 0; p < preconn_count; p++) {
-              esp_websocket_client_send_bin(s_persistent_ws_client, (const char *)preconn_buf[p],
-                                            CHUNK_MONO_BYTES, pdMS_TO_TICKS(500));
+              safe_ws_send_bin((const char *)preconn_buf[p],
+                               CHUNK_MONO_BYTES, pdMS_TO_TICKS(500));
             }
             ESP_LOGI(TAG, "📤 Flushed %d buffered speech chunks post-connect", preconn_count);
             preconn_count = 0;
           }
-          if (esp_websocket_client_send_bin(
-                  s_persistent_ws_client, (const char *)chunk_mono,
-                  CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0) {
+          if (safe_ws_send_bin((const char *)chunk_mono,
+                               CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0) {
             ESP_LOGW(TAG, "Failed to stream PCM frame!");
           }
         } else {
@@ -962,8 +1000,7 @@ static void continuous_mic_stream_task(void *pvParameters) {
                      speech_accum_ms, silence_accum_ms);
             const char *eot = "{\"event\":\"audio_end\"}";
             if (ws_ready())
-              esp_websocket_client_send_text(s_persistent_ws_client, eot,
-                                             strlen(eot), pdMS_TO_TICKS(500));
+              safe_ws_send_text(eot, strlen(eot), pdMS_TO_TICKS(500));
             s_conv_state = CONV_STATE_THINKING;
             s_last_speech_time_ms = t;
             update_led_state(CONV_STATE_THINKING);
@@ -999,9 +1036,8 @@ static void continuous_mic_stream_task(void *pvParameters) {
         speech_accum_ms = chunk_duration_ms;
         silence_accum_ms = 0;
         update_led_state(CONV_STATE_LISTENING);
-        if (ws_ready() && esp_websocket_client_send_bin(
-                              s_persistent_ws_client, (const char *)chunk_mono,
-                              CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0)
+        if (ws_ready() && safe_ws_send_bin((const char *)chunk_mono,
+                                           CHUNK_MONO_BYTES, pdMS_TO_TICKS(1000)) < 0)
           ESP_LOGW(TAG, "Failed to stream PCM frame!");
         continue;
       }
@@ -1271,8 +1307,9 @@ void app_main(void) {
   ESP_LOGI(TAG, "Device reconnect identity: %s", s_device_id);
 
   s_ws_connect_mutex = xSemaphoreCreateMutex();
-  if (!s_ws_connect_mutex) {
-    ESP_LOGE(TAG, "Failed to create WebSocket reconnect mutex!");
+  s_ws_send_mutex = xSemaphoreCreateMutex();
+  if (!s_ws_connect_mutex || !s_ws_send_mutex) {
+    ESP_LOGE(TAG, "Failed to create WebSocket mutexes!");
     rgb_led_set_all_hex(LED_COLOR_ERROR);
     return;
   }
@@ -1298,6 +1335,22 @@ void app_main(void) {
   }
   rgb_led_set_all_hex(LED_COLOR_WIFI_OK);
   vTaskDelay(pdMS_TO_TICKS(400));
+
+  // --- Ensure system time is synchronized via SNTP before validating TLS certificates ---
+  ESP_LOGI(TAG, "Waiting for SNTP time synchronization for TLS certificate validation...");
+  time_t now = 0;
+  struct tm timeinfo = {0};
+  for (int i = 0; i < 40; i++) {
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    if (timeinfo.tm_year >= (2024 - 1900)) {
+      char strftime_buf[64];
+      strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+      ESP_LOGI(TAG, "⏰ SNTP time synchronized: %s", strftime_buf);
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 
   // --- Load USB-provisioned server config from NVS (overrides Kconfig defaults) ---
   {
