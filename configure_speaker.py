@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-DB_PATH = Path(__file__).resolve().parent / "fleet-dashboard" / "backend" / "fleet_db.json"
+DB_PATH = Path(__file__).resolve().parent / "web-dashboard" / "backend" / "fleet_db.json"
 API_URL = "http://localhost:8010/api"
 WS_URL = "ws://localhost:8010/ws/fleet"
 
@@ -331,7 +331,7 @@ def export_c_header(speaker_id: str):
 #define YHEALTH_ASSIGNED_DOC_ID  "{spk.get('doctor_id') or spk.get('doctor_assigned_id', '')}"
 #define YHEALTH_DEFAULT_WIFI_SSID "{spk.get('wifi_ssid', 'TFTus-WiFi')}"
 """
-    out_file = Path(__file__).resolve().parent / "main" / "speaker_identity.h"
+    out_file = Path(__file__).resolve().parent / "hardware" / "main" / "speaker_identity.h"
     with open(out_file, "w", encoding="utf-8") as f:
         f.write(header_content)
     print(f"[OK] Exported C firmware header to: {out_file}")

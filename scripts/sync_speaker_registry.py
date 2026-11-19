@@ -2,7 +2,7 @@
 """
 Sync Utility for YHealth Speaker Fleet Mapping Registry.
 Allows human editing of config/speaker_fleet_registry.json and automatically
-syncs updates into fleet-dashboard/backend/fleet_db.json and PostgreSQL.
+syncs updates into web-dashboard/backend/fleet_db.json and PostgreSQL.
 """
 
 import os
@@ -12,7 +12,7 @@ import argparse
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY_FILE = os.path.join(BASE_DIR, "config", "speaker_fleet_registry.json")
-FLEET_DB_FILE = os.path.join(BASE_DIR, "fleet-dashboard", "backend", "fleet_db.json")
+FLEET_DB_FILE = os.path.join(BASE_DIR, "web-dashboard", "backend", "fleet_db.json")
 
 def load_registry():
     if not os.path.exists(REGISTRY_FILE):
@@ -54,7 +54,7 @@ def sync_to_fleet_db():
 
     # Try sync to Postgres if available
     try:
-        sys.path.append(os.path.join(BASE_DIR, "fleet-dashboard", "backend"))
+        sys.path.append(os.path.join(BASE_DIR, "web-dashboard", "backend"))
         import postgres_db
         count = 0
         for s in speakers:

@@ -528,7 +528,7 @@ async def get_token_metrics():
     }
 
 
-_FLEET_DB_FILE = os.path.join(os.path.dirname(__file__), "..", "fleet-dashboard", "backend", "fleet_db.json")
+_FLEET_DB_FILE = os.path.join(os.path.dirname(__file__), "..", "web-dashboard", "backend", "fleet_db.json")
 
 
 def _load_fleet_speakers():

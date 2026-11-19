@@ -5,7 +5,7 @@ import urllib.parse
 import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FLEET_DB_PATH = os.path.join(BASE_DIR, "..", "fleet-dashboard", "backend", "fleet_db.json")
+FLEET_DB_PATH = os.path.join(BASE_DIR, "..", "web-dashboard", "backend", "fleet_db.json")
 OUTPUT_DIR = os.path.join(BASE_DIR, "..", "speaker_qr_codes")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

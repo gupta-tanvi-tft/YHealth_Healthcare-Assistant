@@ -111,7 +111,7 @@ The voice backend acts as the bridge between hardware streaming and cloud AI:
 
 ---
 
-### Step 3: Fleet Ecosystem API & Status Codes (`fleet-dashboard/backend/app.py`)
+### Step 3: Fleet Ecosystem API & Status Codes (`web-dashboard/backend/app.py`)
 
 The fleet management API on port `8010` is the single source of truth for the dashboard and external integrations.
 

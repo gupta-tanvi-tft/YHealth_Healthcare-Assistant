@@ -1,6 +1,6 @@
 @echo off
 title YHealth Voice Assistant Backend (Port 8008)
-cd /d "%~dp0backend"
+cd /d "%~dp0speaker-backend"
 
 echo ===================================================
 echo Freeing port 8008 from any stale instances...
