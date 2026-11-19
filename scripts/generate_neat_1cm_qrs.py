@@ -26,7 +26,7 @@ except ImportError:
     REPORTLAB_AVAILABLE = False
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MAPPING_FILE = os.path.join(BASE_DIR, "..", "speaker_device_mapping.json")
+MAPPING_FILE = os.path.join(BASE_DIR, "..", "config", "speaker_device_mapping.json")
 OUTPUT_DIR = os.path.join(BASE_DIR, "..", "speaker_qr_codes")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

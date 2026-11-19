@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-MAPPING_FILE = BASE_DIR / "speaker_device_mapping.json"
+MAPPING_FILE = BASE_DIR / "config" / "speaker_device_mapping.json"
 QR_DIR = BASE_DIR / "speaker_qr_codes"
 
 def load_mappings() -> dict:

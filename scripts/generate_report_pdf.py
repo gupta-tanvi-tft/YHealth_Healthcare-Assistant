@@ -541,5 +541,6 @@ def create_audit_pdf(output_path):
     print(f"Successfully generated PDF report: {output_path}")
 
 if __name__ == "__main__":
-    out_file = sys.argv[1] if len(sys.argv) > 1 else "ESP32_S3_Audio_Configurations_Contrast_Report.pdf"
+    default_out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "documentation", "ESP32_S3_Audio_Configurations_Contrast_Report.pdf")
+    out_file = sys.argv[1] if len(sys.argv) > 1 else default_out
     create_audit_pdf(out_file)
