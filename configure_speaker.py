@@ -15,6 +15,57 @@ What it helps you do:
      the speaker's microchip so it knows its own name and doctor.
   5. Send Wi-Fi details (name & password) to the speaker over a USB cable.
   6. Remotely turn volume up/down or send spoken voice announcements.
+
+--------------------------------------------------------------------------------
+💡 JARGON BUSTER (Common technical words explained in plain English):
+--------------------------------------------------------------------------------
+1. UTF-8 Encoding:
+   Computers only understand 1s and 0s. "UTF-8" is the world standard alphabet
+   rule that tells the computer how to convert those numbers into human letters.
+   Using UTF-8 ensures Indian names, special symbols, and accents never turn into
+   weird corrupted question marks like "Dr. Brij  Makkar".
+
+2. JSON (JavaScript Object Notation):
+   A clean, human-readable text format for storing data. It looks like labeled
+   index cards: {"name": "Dr. Makkar", "volume": 75}.
+
+3. MAC Address (Hardware Fingerprint):
+   Stands for "Media Access Control". It is a 12-character physical fingerprint
+   (like "A0:F2:62:E3:4C:80") permanently burned into the speaker's Wi-Fi chip
+   at the factory. No two chips in the world have the same MAC address.
+
+4. WebSocket (WS):
+   Normal web browsing is like sending letters (you ask, page loads). A WebSocket
+   is like an open phone call between the server and dashboard: the moment
+   something happens, both sides hear it instantly without refreshing.
+
+5. REST API & HTTP Methods (POST, PUT, GET):
+   Standard postal rules for computer networks:
+     - POST: "Create a brand new record."
+     - PUT:  "Update an existing record with new details."
+     - GET:  "Fetch and read a record."
+
+6. COM Port (e.g. COM3):
+   Stands for "Communication Port". On Windows computers, it is the virtual
+   doorway number assigned to the physical USB socket your speaker is plugged into.
+
+7. Baud Rate (e.g. 115200):
+   The speed of data traveling through the USB wire. 115,200 baud means
+   115,200 bits of information are sent across the wire every single second.
+
+8. RSSI (Wi-Fi Signal Strength):
+   Stands for "Received Signal Strength Indicator", measured in dBm (decibel-milliwatts).
+   It is always a negative number: -45 dBm is strong (near router), while -85 dBm
+   is very weak (far away, through thick walls).
+
+9. PCM Audio (Pulse Code Modulation):
+   Pure, uncompressed digital sound. 16 kHz Mono means the microphone takes
+   16,000 sound snapshots every second on one single audio channel.
+
+10. Regex (Regular Expression):
+    A search pattern rule. Instead of searching for one exact word, it checks
+    if text follows a valid pattern (e.g., checking if an address has 6 pairs of hex digits).
+================================================================================
 """
 
 # ==============================================================================
@@ -24,14 +75,14 @@ What it helps you do:
 
 import os            # Helps find folders and files on your computer (Windows/Mac/Linux)
 import sys           # Lets us read what you typed in the terminal or exit cleanly
-import json          # Reads and writes simple text files stored in JSON format
-import re            # Checks text patterns (for example, checking if a Wi-Fi address is valid)
-import argparse      # Reads flags you type in the terminal (like --list, --add, --watch)
+import json          # Tool to read and write simple data stored in JSON format (labeled index cards)
+import re            # "Regex" pattern checker: checks if text follows a rule (e.g. valid MAC format)
+import argparse      # Reads command-line flags you type in terminal (like --list, --add, --watch)
 import urllib.request # Sends messages over the network to your Web Dashboard
 import urllib.error  # Safely catches errors if the Web Dashboard is turned off
-from datetime import datetime, timezone # Gets the exact current date and time
-from pathlib import Path                # An easy, modern way to handle file paths
-from typing import Dict, Any, List, Optional # Helpful notes for code editors about data types
+from datetime import datetime, timezone # Gets the exact current date and time in universal UTC
+from pathlib import Path                # An easy, modern way to handle file and folder locations
+from typing import Dict, Any, List, Optional # Helpful labels for code editors showing expected data types
 
 
 # ==============================================================================
@@ -43,10 +94,11 @@ from typing import Dict, Any, List, Optional # Helpful notes for code editors ab
 DB_PATH = Path(__file__).resolve().parent / "web-dashboard" / "backend" / "fleet_db.json"
 
 # The web address where our Fleet Management Dashboard is running:
-# (Port 8010 is the backend server that powers the web screen)
+# (Port 8010 is the backend server doorway that powers the dashboard screen)
 API_URL = "http://localhost:8010/api"
 
 # The live stream address (WebSocket) used to send instant alerts without refreshing:
+# (ws:// is the WebSocket protocol, just like http:// is the website protocol)
 WS_URL = "ws://localhost:8010/ws/fleet"
 
 
@@ -66,9 +118,11 @@ def load_registry() -> List[Dict[str, Any]]:
     # Step 1: Check if the database file actually exists on your computer:
     if DB_PATH.exists():
         try:
-            # Step 2: Open the file for reading ('r' stands for read) with clean text encoding:
+            # Step 2: Open the file for reading ('r' stands for read).
+            # JARGON: encoding="utf-8" guarantees international names, Hindi characters,
+            # and doctor accents are read cleanly without turning into weird symbols.
             with open(DB_PATH, "r", encoding="utf-8") as f:
-                # Step 3: Turn the raw text from the file into an easy Python list:
+                # Step 3: Turn the raw JSON text from the file into an easy Python list:
                 return json.load(f)
         except Exception as e:
             # If the file was damaged or couldn't be opened, print a helpful warning:
@@ -89,9 +143,11 @@ def save_registry(registry: List[Dict[str, Any]]) -> bool:
         # Step 1: Make sure the folder (web-dashboard/backend) exists; create it if missing:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         
-        # Step 2: Open the file for writing ('w' stands for write, replacing old text):
+        # Step 2: Open the file for writing ('w' stands for write, replacing old text).
+        # JARGON: encoding="utf-8" ensures text is saved cleanly in universal standard format.
         with open(DB_PATH, "w", encoding="utf-8") as f:
             # Step 3: Write the list into the file neatly formatted with 2 spaces indentation:
+            # ensure_ascii=False allows non-English characters (like Hindi) to stay readable!
             json.dump(registry, f, indent=2, ensure_ascii=False)
             
         return True # Everything saved smoothly!
@@ -108,13 +164,18 @@ def sync_with_live_api(method: str, endpoint: str, payload: dict) -> bool:
     knocks on the door of the running Web Dashboard (Port 8010) and says:
     "Hey! A speaker was updated, please refresh the web screen right now!"
 
+    JARGON EXPLANATION:
+      - method: The action rule ('POST' to add, 'PUT' to edit).
+      - endpoint: The sub-doorway URL (e.g. '/speakers').
+      - payload: The package of speaker details (ID, name, volume) being sent.
+
     If the Web Dashboard server isn't running, that is totally fine! The change
     is already saved on disk, so this function simply ignores the error.
     """
     # Build the full web link, for example: http://localhost:8010/api/speakers
     url = f"{API_URL}/{endpoint.lstrip('/')}"
     try:
-        # Convert our Python information dictionary into raw network bytes:
+        # Convert our Python information dictionary into raw network bytes (encoded in utf-8):
         data = json.dumps(payload).encode("utf-8")
         
         # Prepare the network request (telling the server: "This is JSON data"):
@@ -127,7 +188,7 @@ def sync_with_live_api(method: str, endpoint: str, payload: dict) -> bool:
         
         # Send the message, but only wait up to 1.5 seconds so we never get stuck:
         with urllib.request.urlopen(req, timeout=1.5) as resp:
-            # Status 200 or 201 means "Success! Server received your message":
+            # JARGON: HTTP status 200 or 201 means "Success! Server received your message":
             if resp.status in (200, 201):
                 return True
     except Exception:
@@ -139,7 +200,7 @@ def sync_with_live_api(method: str, endpoint: str, payload: dict) -> bool:
 # ==============================================================================
 # SECTION 4: CHECKING AND CLEANING HARDWARE "MAC" ADDRESSES
 # ==============================================================================
-# What is a MAC address?
+# JARGON: What is a MAC address?
 # It is a unique 12-character fingerprint code permanently built into the speaker's
 # Wi-Fi chip (like a car's VIN number or a passport number).
 # Example: "A0:F2:62:E3:4C:80"
@@ -157,7 +218,8 @@ def validate_mac(mac: str) -> bool:
     # Remove extra spaces and make all letters uppercase:
     clean = mac.strip().upper()
     
-    # Check if the letters and numbers match the official 12-hex-digit rule:
+    # JARGON: re.match uses "Regex" (pattern matching).
+    # It checks if the text consists of exactly 6 pairs of hexadecimal digits (0-9, A-F):
     return bool(
         re.match(r"^([0-9A-F]{2}[:-]){5}([0-9A-F]{2})$", clean)
         or re.match(r"^[0-9A-F]{12}$", clean)
@@ -208,6 +270,7 @@ def print_speaker_table(speakers: List[Dict[str, Any]], role_filter: str = None)
     print("=" * 132)
     
     # Print the column headers with exact spacing so everything lines up straight:
+    # JARGON: {'ID':<8} means "Reserve 8 character spaces for ID and align it to the left".
     print(f"{'ID':<8} {'MAC Address':<18} {'Role':<8} {'Vol':<5} {'Assigned To':<22} {'Status':<9} {'Key Clinical / Clinic Metadata':<54}")
     print("-" * 132)
 
@@ -292,14 +355,18 @@ def add_or_update_speaker(data: Dict[str, Any]) -> bool:
         "name": data.get("name", "Unassigned"),
         "phone": data.get("phone", ""),
         "email": data.get("email", ""),
+        # JARGON: datetime.now(timezone.utc).isoformat() creates a universal standard timestamp
+        # like "2026-11-19T09:00:00Z" understood by all computers worldwide.
         "assigned_date": datetime.now(timezone.utc).isoformat(),
         "status": data.get("status", "online"),
         "last_seen_at": "Just now",
         "wifi_ssid": data.get("wifi_ssid", "TFTus-WiFi"),
+        # JARGON: wifi_rssi is signal strength in dBm (-52 is good signal):
         "wifi_rssi": data.get("wifi_rssi", -52),
         "volume": int(data.get("volume", 75)),
         "power_source": data.get("power_source", "100% (USB-C Continuous)"),
         "firmware_version": "v1.2.0-S3 (Dual ES7210+ES8311)",
+        # JARGON: 16 kHz Mono PCM means 16,000 uncompressed audio samples per second:
         "stream_rate": "16 kHz Mono PCM (32 KB/s)"
     }
 
@@ -338,6 +405,7 @@ def add_or_update_speaker(data: Dict[str, Any]) -> bool:
     save_registry(registry)
 
     # Step 7: Push the update live to the Web Dashboard:
+    # JARGON: "PUT" is used when updating an existing device, "POST" when creating a new one:
     if is_update:
         sync_with_live_api("PUT", f"/speakers/{raw_id}", record)
     else:
@@ -366,7 +434,7 @@ def send_remote_command(speaker_id: str, command: str, payload: dict):
     payload["command"] = command
     print(f"[DISPATCHING] Sending '{command}' command to speaker {spk_id}...")
 
-    # Send command to the running backend server:
+    # Send command to the running backend server over HTTP POST:
     success = sync_with_live_api("POST", f"/speakers/{spk_id}/command", payload)
     if success:
         print(f"[SUCCESS] Command acknowledged & broadcast to {spk_id} and all connected dashboards!")
@@ -384,7 +452,7 @@ def send_remote_command(speaker_id: str, command: str, payload: dict):
 
 
 # ==============================================================================
-# SECTION 8: LIVE EVENT WATCHER (WATCHING EVENTS AS THEY HAPPEN)
+# SECTION 8: REAL-TIME EVENT STREAM WATCHER (WATCHING EVENTS AS THEY HAPPEN)
 # ==============================================================================
 
 def watch_fleet_events():
@@ -397,8 +465,8 @@ def watch_fleet_events():
     """
     # Need websockets package for live listening:
     try:
-        import websockets
-        import asyncio
+        import websockets # Handles the live two-way open connection
+        import asyncio    # Handles asynchronous background listening without blocking
     except ImportError:
         print("[!] Install websockets to use real-time terminal watch: pip install websockets")
         return
@@ -410,10 +478,10 @@ def watch_fleet_events():
         print("  Listening for dynamic modifications, pings, and commands...")
         print("=" * 60 + "\n")
         try:
-            # Connect to our server's live event line:
+            # JARGON: Connect to the server's WebSocket line (WS_URL):
             async with websockets.connect(WS_URL) as ws:
                 while True:
-                    # Wait for next event to arrive from any speaker:
+                    # Wait for next event to arrive from any speaker over the wire:
                     msg = await ws.recv()
                     data = json.loads(msg)
                     evt = data.get("event")
@@ -511,6 +579,11 @@ def export_c_header(speaker_id: str):
       hardware/main/speaker_identity.h
 
     When you flash firmware onto the speaker, this file is baked right into it!
+
+    JARGON IN THIS FILE:
+      - #pragma once: Tells the C compiler "Read this file only once, don't duplicate it".
+      - #define: Creates a permanent constant label (like a fixed name tag).
+      - 0x... : Hexadecimal notation for raw computer byte numbers.
     """
     registry = load_registry()
     
@@ -542,7 +615,7 @@ def export_c_header(speaker_id: str):
     # Destination file inside our hardware folder:
     out_file = Path(__file__).resolve().parent / "hardware" / "main" / "speaker_identity.h"
     
-    # Write the C code into the file:
+    # Write the C code into the file (using universal utf-8 encoding):
     with open(out_file, "w", encoding="utf-8") as f:
         f.write(header_content)
         
@@ -560,30 +633,34 @@ def provision_usb_serial(port: str, ssid: str, password: str, baud: int = 115200
     to send your clinic Wi-Fi credentials straight into the speaker.
     
     Example: python configure_speaker.py --provision-usb --port COM3 --ssid "ClinicWiFi" --password "12345"
+
+    JARGON:
+      - port (e.g. COM3): The USB doorway number your speaker is plugged into on Windows.
+      - baud (115200): The data speed (115,200 pulses per second) across the USB cable.
     """
     try:
-        import serial # Needs 'pyserial' package to talk over USB COM ports
+        import serial # Needs 'pyserial' library to talk over physical USB COM ports
     except ImportError:
         print("[!] PySerial is required for USB provisioning. Install with: pip install pyserial")
         return
 
     print(f"[...] Connecting to ESP32 on {port} @ {baud} baud...")
     try:
-        # Open communication through the USB port:
+        # Open communication through the USB port with a 3-second safety timeout:
         ser = serial.Serial(port, baud, timeout=3.0)
         
-        # Build the command: SET_WIFI:MyWifiName:MyWifiPassword
+        # Build the command string: SET_WIFI:MyWifiName:MyWifiPassword
         cmd = f"SET_WIFI:{ssid}:{password}\n"
         print(f"[SENDING] {cmd.strip()}")
         
-        # Send the command across the USB wire:
+        # JARGON: encode("utf-8") converts English text into electrical bytes for the wire:
         ser.write(cmd.encode("utf-8"))
         
-        # Read back the speaker's response:
+        # Read back the speaker's response (e.g. "OK:WIFI_SAVED"):
         res = ser.readline().decode("utf-8", errors="ignore").strip()
         print(f"[ESP32 RESPONSE] {res}")
         
-        # Always close the USB port when done:
+        # Always close the USB port when done so other programs can use it:
         ser.close()
         print("[SUCCESS] USB Provisioning complete!")
     except Exception as e:
@@ -600,7 +677,7 @@ def main():
     This is the front door of the program. When you type commands in your terminal,
     this function looks at what flags you typed and sends you to the right place.
     """
-    # Set up our flag reader:
+    # Set up our flag reader ("argparse"):
     parser = argparse.ArgumentParser(description="YHealth Real-Time Speaker Ecosystem Configuration & Provisioning Tool")
     
     # General view flags:
